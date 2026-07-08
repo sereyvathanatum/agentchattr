@@ -13,7 +13,8 @@ let agentConfig = {};  // { name: { color, label } } — registered instances (u
 let baseColors = {};   // { name: { color, label } } — base agent colors (for message coloring)
 let todos = {};  // { msg_id: "todo" | "done" }
 let rules = [];  // array of rule objects from server
-let activeMentions = new Set();  // agent names with pre-@ toggled on
+let activeMentions = new Set();  // agent names with pre-@ toggled on (for the active channel)
+let _channelMentions = {};  // channel -> array of toggled agent names (per-channel memory of activeMentions)
 let replyingTo = null;  // { id, sender, text } or null
 let unreadCount = 0;    // messages received while scrolled up
 let lastMessageDate = null;  // track date for dividers (general channel)
@@ -408,6 +409,12 @@ function connectWebSocket() {
             if (activeMentions.has(event.old_name)) {
                 activeMentions.delete(event.old_name);
                 activeMentions.add(event.new_name);
+            }
+            // Migrate the per-channel remembered toggles too
+            for (const ch of Object.keys(_channelMentions)) {
+                const arr = _channelMentions[ch];
+                const idx = arr.indexOf(event.old_name);
+                if (idx !== -1) arr[idx] = event.new_name;
             }
             // Update sender name, color, and avatar on all existing messages in the DOM
             const newColor = getColor(event.new_name);
@@ -2908,6 +2915,19 @@ function renderTodosPanel() {
 }
 
 // --- Mention toggles ---
+
+// Called by switchChannel (channels.js) so the sticky @-tag toggles are
+// remembered per channel. Prevents carrying a tag (e.g. @codex from #bugfixing)
+// into a channel where you meant to tag someone else.
+window._onChannelSwitchMentions = function(oldChannel, newChannel) {
+    if (oldChannel) _channelMentions[oldChannel] = [...activeMentions];
+    activeMentions = new Set(_channelMentions[newChannel] || []);
+    // Reflect the swapped state on the toggle buttons
+    for (const btn of document.querySelectorAll('.mention-toggle')) {
+        btn.classList.toggle('active', activeMentions.has(btn.dataset.agent));
+    }
+    if (typeof updateSchedulePopoverState === 'function') updateSchedulePopoverState();
+};
 
 function buildMentionToggles() {
     const container = document.getElementById('mention-toggles');

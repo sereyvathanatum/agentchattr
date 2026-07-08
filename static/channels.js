@@ -292,10 +292,13 @@ function _sidebarConfirmDelete(name, row, label) {
 
 function switchChannel(name) {
     if (name === window.activeChannel) return;
+    const prevChannel = window.activeChannel;
     // Save top-visible message ID for current channel
     const topId = _getTopVisibleMsgId();
     if (topId) _channelScrollMsg[window.activeChannel] = topId;
     window._setActiveChannel(name);
+    // Swap the sticky @-mention toggles to this channel's remembered set
+    if (window._onChannelSwitchMentions) window._onChannelSwitchMentions(prevChannel, name);
     window.channelUnread[name] = 0;
     localStorage.setItem('agentchattr-channel', name);
     filterMessagesByChannel();

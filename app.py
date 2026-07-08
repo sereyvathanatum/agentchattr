@@ -382,7 +382,7 @@ def configure(cfg: dict, session_token: str = ""):
                                         "new_name": renamed["new"],
                                     })
                                     asyncio.run_coroutine_threadsafe(_broadcast(rename_event), _event_loop)
-                            store.add(name, f"{name} disconnected (timeout)", msg_type="leave", channel=_last_active_channel)
+                            store.add(name, f"{name} disconnected (timeout)", msg_type="leave", channel=_agent_last_channel.get(name, _last_active_channel))
                             _posted_leave.add(name)
 
                 # Re-fetch registered names (may have changed from crash timeout above)
@@ -404,7 +404,7 @@ def configure(cfg: dict, session_token: str = ""):
                     # Post leave message ONCE per offline transition (debounced)
                     if name not in _posted_leave:
                         _posted_leave.add(name)
-                        store.add(name, f"{name} disconnected", msg_type="leave", channel=_last_active_channel)
+                        store.add(name, f"{name} disconnected", msg_type="leave", channel=_agent_last_channel.get(name, _last_active_channel))
 
                 # Clear leave debounce for agents that came back online
                 _posted_leave -= currently_online
@@ -421,7 +421,7 @@ def configure(cfg: dict, session_token: str = ""):
                         continue
                     if not registry.is_registered(name) and name not in _posted_leave:
                         _posted_leave.add(name)
-                        store.add(name, f"{name} disconnected", msg_type="leave", channel=_last_active_channel)
+                        store.add(name, f"{name} disconnected", msg_type="leave", channel=_agent_last_channel.get(name, _last_active_channel))
 
                 if _known_online != currently_online and _event_loop:
                     asyncio.run_coroutine_threadsafe(broadcast_status(), _event_loop)
@@ -488,6 +488,11 @@ def configure(cfg: dict, session_token: str = ""):
 
 _event_loop = None  # set by run.py after starting the event loop
 _last_active_channel: str = "general"  # last channel any message was sent in
+# Per-agent last channel: where each sender was most recently active. Used to
+# route leave/disconnect messages to the channel that agent was talking in,
+# instead of the global last-active channel (which is usually #general and made
+# leave spam land in the wrong place).
+_agent_last_channel: dict[str, str] = {}
 
 
 def set_event_loop(loop):
@@ -650,6 +655,10 @@ async def _handle_new_message(msg: dict):
     global _last_active_channel
     if msg_type not in ("system", "leave", "join"):
         _last_active_channel = channel
+        # Remember where this specific sender was last active so their
+        # disconnect message follows them to the right channel.
+        if sender and sender != "system":
+            _agent_last_channel[sender] = channel
     # Strip @mentions to find the slash command (e.g. "@claude @codex /hatmaking")
     stripped = _re.sub(r"@[\w-]+\s*", "", text).strip().lower()
     _broadcast_cmds = ("/hatmaking", "/artchallenge", "/roastreview", "/poetry")
