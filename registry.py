@@ -40,9 +40,11 @@ class RuntimeRegistry:
         self._instances: dict[str, Instance] = {}   # canonical name → Instance
         self._reserved: dict[str, float] = {}       # name → deregister timestamp
         self._renames: dict[str, str] = {}           # old name → new name (for heartbeat redirect)
+        self._reclaimable: dict[str, Instance] = {}  # name → deregistered Instance, recoverable on reconnect
         self._on_change_cbs: list = []
         self._data_dir = Path(data_dir)
         self._load_renames()
+        self._load_instances()
 
     # --- Setup ---
 
@@ -87,6 +89,97 @@ class RuntimeRegistry:
             tmp.replace(self._renames_path())
         except Exception:
             pass
+
+    # --- Instance persistence (survives server restart) ---
+
+    def _instances_path(self) -> Path:
+        return self._data_dir / "registry.json"
+
+    def _save_instances(self):
+        """Persist live + reclaimable instances (incl. tokens) to disk.
+
+        Tokens live in the local ./data dir, consistent with the existing local-only
+        posture (server binds 127.0.0.1). Must be called outside the lock.
+        """
+        try:
+            self._data_dir.mkdir(parents=True, exist_ok=True)
+            with self._lock:
+                data = {
+                    "instances": {n: _inst_full(i) for n, i in self._instances.items()},
+                    "reclaimable": {n: _inst_full(i) for n, i in self._reclaimable.items()},
+                }
+            tmp = self._instances_path().with_suffix(".tmp")
+            tmp.write_text(json.dumps(data), "utf-8")
+            tmp.replace(self._instances_path())
+        except Exception:
+            pass
+
+    def _load_instances(self):
+        p = self._instances_path()
+        if not p.exists():
+            return
+        try:
+            data = json.loads(p.read_text("utf-8"))
+        except Exception:
+            return
+        # On startup nobody is proven alive: a persisted "active" instance may be a
+        # dead pre-restart wrapper. Load everything as reclaimable — a wrapper that is
+        # genuinely still alive reactivates its token on its next call (resolve_token),
+        # while dead wrappers stay dormant instead of squatting a slot. Loading them as
+        # active would make the empty post-restart presence map immortalize the ghost
+        # (the crash-timeout only fires for names with last_seen > 0).
+        for section in ("instances", "reclaimable"):
+            for n, d in data.get(section, {}).items():
+                try:
+                    self._reclaimable[n] = _inst_from_dict(d)
+                except Exception:
+                    pass
+
+    def _restore_reclaimable_locked(self, sender: str, target_name: str | None):
+        """Restore a reclaimable identity into the live set if its live copy is gone.
+
+        Lets chat_claim recover an identity deregistered by the crash-timeout during
+        sleep. Must be called while holding self._lock. A name freshly re-registered by
+        someone else is left untouched (fresh registration wins).
+        """
+        if sender in self._instances:
+            return
+        cand = None
+        if sender in self._reclaimable:                      # exact name (e.g. 'claude-2')
+            cand = sender
+        elif sender in self._bases:                          # family: first free reclaimable of base
+            for name, inst in self._reclaimable.items():
+                if inst.base == sender and name not in self._instances:
+                    cand = name
+                    break
+        if not cand or cand in self._instances:
+            return
+        inst = self._reclaimable[cand]
+        # Fresh-wins: never revive an identity whose (base, slot) is already live
+        # (e.g. its slot was reclaimed by a fresh launch or a rename-back).
+        if any(li.base == inst.base and li.slot == inst.slot for li in self._instances.values()):
+            return
+        self._reclaimable.pop(cand, None)
+        self._reserved.pop(cand, None)
+        self._instances[cand] = inst
+
+    def _evict_reclaimable_collisions_locked(self):
+        """Drop reclaimables that collide with any live instance, by name or (base, slot).
+
+        The live instance is authoritative: a reclaimable sharing its canonical name or
+        its (base, slot) coordinate is stale and must not survive to be persisted. If it
+        did, `_save_instances` would write both records and `_load_instances` could let
+        the stale one overwrite the live one (same dict key) on restart — reviving a dead
+        token and stranding the live one. Call this after any mutation that creates or
+        moves a live instance (register incl. slot-1 rename, deregister rename-back,
+        claim, rename), while holding self._lock. Keeps _instances and _reclaimable
+        disjoint so the persisted snapshot is always unambiguous.
+        """
+        live_names = set(self._instances.keys())
+        live_coords = {(i.base, i.slot) for i in self._instances.values()}
+        for rn in [rn for rn, ri in self._reclaimable.items()
+                   if rn in live_names or (ri.base, ri.slot) in live_coords]:
+            del self._reclaimable[rn]
 
     # --- Registration ---
 
@@ -148,12 +241,17 @@ class RuntimeRegistry:
             state = "active"
             inst = Instance(name=name, base=base, slot=slot, label=lbl, color=color, state=state)
             self._instances[name] = inst
+            # Fresh registration (plus any slot-1 rename above) supersedes reclaimable
+            # identities sharing those names/(base, slot) coordinates — including custom
+            # aliases that don't match `name`. Enforces fresh-wins by coordinate, not name.
+            self._evict_reclaimable_collisions_locked()
             result = _inst_dict(inst, include_token=True)
             if renamed_slot1:
                 result["_renamed_slot1"] = renamed_slot1
 
         self._notify()
         self._save_renames()
+        self._save_instances()
         return result
 
     def deregister(self, name: str) -> dict | None:
@@ -165,9 +263,11 @@ class RuntimeRegistry:
         with self._lock:
             if name not in self._instances:
                 return None
-            base = self._instances[name].base
+            inst_removed = self._instances[name]
+            base = inst_removed.base
             del self._instances[name]
             self._reserved[name] = time.time()
+            self._reclaimable[name] = inst_removed  # keep token recoverable on reconnect
 
             # If family drops to 1 instance with a numbered name, rename back to base
             renamed_back = None
@@ -187,8 +287,14 @@ class RuntimeRegistry:
                     self._renames[old_name] = base
                     renamed_back = {"old": old_name, "new": base}
 
+            # A rename-back may have moved a live instance onto a (base, slot) that the
+            # just-deregistered identity still occupies in _reclaimable — drop such stale
+            # collisions so they can't outlive the live identity across a restart.
+            self._evict_reclaimable_collisions_locked()
+
         self._notify()
         self._save_renames()
+        self._save_instances()
         result = {"ok": True}
         if renamed_back:
             result["_renamed_back"] = renamed_back
@@ -209,6 +315,8 @@ class RuntimeRegistry:
         error = None
         result = None
         with self._lock:
+            # Recover a reclaimable identity (e.g. deregistered by crash-timeout during sleep)
+            self._restore_reclaimable_locked(sender, target_name)
             inst = None
 
             # If sender is a base family name, use family-based matching
@@ -282,10 +390,16 @@ class RuntimeRegistry:
                         self._renames[old_name] = target_name
                         result = _inst_dict(inst)
 
+            # If we activated/renamed a live instance into a (base, slot), drop any
+            # reclaimable now colliding with it (same invariant as register/deregister).
+            if not error:
+                self._evict_reclaimable_collisions_locked()
+
         if error:
             return error
         self._notify()
         self._save_renames()
+        self._save_instances()
         return result
 
     def confirm_pending(self, name: str) -> bool:
@@ -298,6 +412,7 @@ class RuntimeRegistry:
 
         self._notify()
         self._save_renames()
+        self._save_instances()
         return True
 
     # --- Rename / Label ---
@@ -359,8 +474,13 @@ class RuntimeRegistry:
                 self._renames[old_name] = new_name
                 result = _inst_dict(inst)
 
+            # Renaming moved a live instance onto new_name/(base, slot); drop any
+            # reclaimable now colliding with it (same fresh-wins invariant).
+            self._evict_reclaimable_collisions_locked()
+
         self._notify()
         self._save_renames()
+        self._save_instances()
         return result
 
     def set_label(self, name: str, label: str) -> bool:
@@ -373,6 +493,7 @@ class RuntimeRegistry:
 
         self._notify()
         self._save_renames()
+        self._save_instances()
         return True
 
     # --- Queries ---
@@ -503,12 +624,43 @@ class RuntimeRegistry:
             return i is not None and i.state == "pending"
 
     def resolve_token(self, token: str) -> dict | None:
-        """Map an instance_token to the current canonical instance dict, or None."""
+        """Map an instance_token to the current canonical instance dict, or None.
+
+        If the token belongs to a deregistered-but-reclaimable instance (e.g. the agent
+        was crash-timed-out while the machine slept), reactivate it transparently rather
+        than rejecting it — provided its name has not since been freshly re-registered.
+        """
+        result = None
+        reactivated = False
+        changed = False
         with self._lock:
             for inst in self._instances.values():
                 if inst.token == token:
                     return _inst_dict(inst)
-        return None
+            for name, inst in list(self._reclaimable.items()):
+                if inst.token != token or name in self._instances:
+                    continue
+                # Fresh-wins guard: if a live instance already holds this (base, slot),
+                # the token is stale (its identity was superseded by a fresh launch or a
+                # rename-back). Drop it rather than reviving a colliding second instance.
+                if any(li.base == inst.base and li.slot == inst.slot
+                       for li in self._instances.values()):
+                    del self._reclaimable[name]
+                    changed = True
+                    continue
+                inst.state = "active"
+                self._instances[name] = inst
+                del self._reclaimable[name]
+                self._reserved.pop(name, None)
+                result = _inst_dict(inst)
+                reactivated = True
+                changed = True
+                break
+        if reactivated:
+            self._notify()
+        if changed:
+            self._save_instances()
+        return result
 
     def get_pending(self) -> list[dict]:
         """All pending instances (for timeout checks)."""
@@ -575,6 +727,24 @@ def _inst_dict(inst: Instance, include_token: bool = False) -> dict:
     if include_token:
         d["token"] = inst.token
     return d
+
+
+def _inst_full(inst: Instance) -> dict:
+    """Full serialization incl. token + identity, for persistence/reclaim."""
+    return {
+        "name": inst.name, "base": inst.base, "slot": inst.slot, "label": inst.label,
+        "color": inst.color, "identity_id": inst.identity_id, "token": inst.token,
+        "epoch": inst.epoch, "state": inst.state, "registered_at": inst.registered_at,
+    }
+
+
+def _inst_from_dict(d: dict) -> Instance:
+    return Instance(
+        name=d["name"], base=d["base"], slot=int(d["slot"]), label=d["label"],
+        color=d["color"], identity_id=d.get("identity_id", uuid.uuid4().hex),
+        token=d["token"], epoch=int(d.get("epoch", 1)), state=d.get("state", "active"),
+        registered_at=float(d.get("registered_at", time.time())),
+    )
 
 
 def _derive_color(base_hex: str, slot: int) -> str:
