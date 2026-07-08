@@ -23,7 +23,6 @@ VK_RETURN = 0x0D
 # Console-mode bits for SetConsoleMode (Windows Console API)
 ENABLE_PROCESSED_OUTPUT = 0x0001
 ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
-ENABLE_VIRTUAL_TERMINAL_INPUT = 0x0200
 
 # Window message constants used by the wm_setfocus Enter backend.
 WM_SETFOCUS = 0x0007
@@ -32,17 +31,25 @@ WA_ACTIVE = 1
 
 
 def enable_vt_mode(verbose: bool = True):
-    """Enable virtual terminal processing on the underlying console.
+    """Enable virtual terminal processing on the underlying console (output only).
 
     Newer TUI agents (codex, claude, etc.) emit ANSI escape sequences directly
     rather than calling SetConsoleMode themselves. Without VT processing enabled,
     sequences like `?2026h` (synchronized output) leak as literal text and the
     UI is unreadable.
 
-    We open CONOUT$/CONIN$ directly via CreateFileW rather than going through the
+    We open CONOUT$ directly via CreateFileW rather than going through the
     inherited STDOUT handle — this way, even if Python's stdio has been
     redirected through pipes (or a Node/Rust child later reopens its own handle
     to the console), the underlying conhost device gets the mode flipped.
+
+    Deliberately does NOT touch CONIN$. Forcing ENABLE_VIRTUAL_TERMINAL_INPUT
+    makes conhost translate window focus changes into `ESC[I`/`ESC[O` byte
+    sequences instead of native FOCUS_EVENT records. TUIs that read input via
+    the Win32 event API (codex/crossterm) then see the sequence as loose
+    keystrokes — the lone ESC clears the composer (wiping injected text) and
+    `[I` gets typed literally. Injection via WriteConsoleInputW works without
+    the bit; CLIs that want VT input set it themselves.
 
     Safe to call multiple times. Failures are logged but not fatal.
     """
@@ -70,8 +77,6 @@ def enable_vt_mode(verbose: bool = True):
     targets = (
         ("CONOUT$", GENERIC_READ | GENERIC_WRITE,
          ENABLE_VIRTUAL_TERMINAL_PROCESSING | ENABLE_PROCESSED_OUTPUT, "stdout"),
-        ("CONIN$",  GENERIC_READ | GENERIC_WRITE,
-         ENABLE_VIRTUAL_TERMINAL_INPUT, "stdin"),
     )
 
     for device, access, extra_bits, label in targets:
