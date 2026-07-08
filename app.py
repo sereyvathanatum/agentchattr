@@ -375,6 +375,7 @@ def configure(cfg: dict, session_token: str = ""):
                             if renamed:
                                 mcp_bridge.migrate_identity(renamed["old"], renamed["new"])
                                 store.rename_sender(renamed["old"], renamed["new"])
+                                _migrate_agent_last_channel(renamed["old"], renamed["new"])
                                 if _event_loop:
                                     rename_event = json.dumps({
                                         "type": "agent_renamed",
@@ -493,6 +494,21 @@ _last_active_channel: str = "general"  # last channel any message was sent in
 # instead of the global last-active channel (which is usually #general and made
 # leave spam land in the wrong place).
 _agent_last_channel: dict[str, str] = {}
+
+
+def _migrate_agent_last_channel(old_name: str, new_name: str):
+    """Re-key _agent_last_channel across an agent rename.
+
+    Without this, a disconnect for the post-rename name misses the map and
+    falls back to the global last-active channel — putting the leave message
+    back in the wrong channel. Call this beside every migrate_identity /
+    rename_sender path (slot-1 rename, renamed-back, websocket rename_agent,
+    /api/label)."""
+    if old_name == new_name:
+        return
+    ch = _agent_last_channel.pop(old_name, None)
+    if ch is not None:
+        _agent_last_channel[new_name] = ch
 
 
 def set_event_loop(loop):
@@ -1307,6 +1323,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             mcp_bridge.migrate_identity(agent_name, new_id)
                             # Update sender on all historical messages
                             store.rename_sender(agent_name, new_id)
+                            _migrate_agent_last_channel(agent_name, new_id)
                             # Notify clients so they can update sender in DOM
                             rename_event = json.dumps({
                                 "type": "agent_renamed",
@@ -1346,6 +1363,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 mcp_bridge.migrate_identity(agent_name, new_id)
                                 # Update sender on all historical messages
                                 store.rename_sender(agent_name, new_id)
+                                _migrate_agent_last_channel(agent_name, new_id)
                                 rename_event = json.dumps({
                                     "type": "agent_renamed",
                                     "old_name": agent_name,
@@ -2109,6 +2127,7 @@ async def register_agent(request: Request):
     if renamed:
         mcp_bridge.migrate_identity(renamed["old"], renamed["new"])
         store.rename_sender(renamed["old"], renamed["new"])
+        _migrate_agent_last_channel(renamed["old"], renamed["new"])
         if _event_loop:
             rename_event = json.dumps({
                 "type": "agent_renamed",
@@ -2153,6 +2172,7 @@ async def deregister_agent(name: str, request: Request):
     if renamed:
         mcp_bridge.migrate_identity(renamed["old"], renamed["new"])
         store.rename_sender(renamed["old"], renamed["new"])
+        _migrate_agent_last_channel(renamed["old"], renamed["new"])
         if _event_loop:
             rename_event = json.dumps({
                 "type": "agent_renamed",
@@ -2196,6 +2216,7 @@ async def rename_agent_label(name: str, request: Request):
     mcp_bridge.migrate_identity(name, new_id)
     # Update sender on all historical messages
     store.rename_sender(name, new_id)
+    _migrate_agent_last_channel(name, new_id)
     return JSONResponse({"ok": True, "new_name": new_id})
 
 

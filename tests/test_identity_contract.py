@@ -459,5 +459,44 @@ class ProxyDisconnectNoiseTests(unittest.TestCase):
         self.assertFalse(mcp_proxy._is_benign_client_disconnect(ValueError()))
 
 
+class AgentLastChannelRenameTests(unittest.TestCase):
+    """Disconnect messages route to each agent's own last-active channel; that
+    mapping must survive renames or the leave lands in the wrong channel."""
+
+    def setUp(self):
+        self._saved = dict(app._agent_last_channel)
+        app._agent_last_channel.clear()
+
+    def tearDown(self):
+        app._agent_last_channel.clear()
+        app._agent_last_channel.update(self._saved)
+
+    def test_migrate_rekeys_old_to_new(self):
+        app._agent_last_channel["claude"] = "bugfixing"
+        app._migrate_agent_last_channel("claude", "claude-1")
+        # New name inherits the channel; a later disconnect for "claude-1"
+        # now resolves to #bugfixing instead of the global fallback.
+        self.assertEqual(app._agent_last_channel.get("claude-1"), "bugfixing")
+        self.assertNotIn("claude", app._agent_last_channel)
+
+    def test_migrate_noop_when_no_prior_channel(self):
+        # Renaming an agent that never spoke must not fabricate an entry.
+        app._migrate_agent_last_channel("ghost", "ghost-1")
+        self.assertNotIn("ghost", app._agent_last_channel)
+        self.assertNotIn("ghost-1", app._agent_last_channel)
+
+    def test_migrate_same_name_is_noop(self):
+        app._agent_last_channel["codex"] = "general"
+        app._migrate_agent_last_channel("codex", "codex")
+        self.assertEqual(app._agent_last_channel.get("codex"), "general")
+
+    def test_renamed_back_preserves_channel(self):
+        # e.g. "claude-1" -> "claude" when the other instance leaves.
+        app._agent_last_channel["claude-1"] = "design"
+        app._migrate_agent_last_channel("claude-1", "claude")
+        self.assertEqual(app._agent_last_channel.get("claude"), "design")
+        self.assertNotIn("claude-1", app._agent_last_channel)
+
+
 if __name__ == "__main__":
     unittest.main()
