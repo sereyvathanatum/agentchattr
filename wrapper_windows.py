@@ -253,6 +253,53 @@ kernel32.ReadConsoleOutputW.argtypes = [
 kernel32.ReadConsoleOutputW.restype = wintypes.BOOL
 
 
+def _read_visible_window(handle):
+    """Read the visible console window; returns (char_info_array, width, height) or None."""
+    csbi = _CONSOLE_SCREEN_BUFFER_INFO()
+    if not kernel32.GetConsoleScreenBufferInfo(handle, ctypes.byref(csbi)):
+        return None
+    rect = csbi.srWindow
+    width = rect.Right - rect.Left + 1
+    height = rect.Bottom - rect.Top + 1
+    if width <= 0 or height <= 0:
+        return None
+    buffer_size = _COORD(width, height)
+    buffer_coord = _COORD(0, 0)
+    read_rect = _SMALL_RECT(rect.Left, rect.Top, rect.Right, rect.Bottom)
+    char_info_array = (_CHAR_INFO * (width * height))()
+    ok = kernel32.ReadConsoleOutputW(
+        handle, char_info_array, buffer_size, buffer_coord,
+        ctypes.byref(read_rect),
+    )
+    if not ok:
+        return None
+    return char_info_array, width, height
+
+
+def get_screen_reader():
+    """Return a callable that reads the visible console text as a string (or None)."""
+    handle = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+
+    def read_screen():
+        try:
+            result = _read_visible_window(handle)
+            if result is None:
+                return None
+            char_info_array, width, height = result
+            rows = []
+            for y in range(height):
+                row = "".join(
+                    char_info_array[y * width + x].Char.UnicodeChar
+                    for x in range(width)
+                )
+                rows.append(row.rstrip())
+            return "\n".join(rows)
+        except Exception:
+            return None
+
+    return read_screen
+
+
 def get_activity_checker(pid_holder, agent_name="unknown", trigger_flag=None):
     """Return a callable that detects agent activity by diffing visible characters.
 

@@ -135,6 +135,16 @@ max_size_mb = 10
 #                                   without "type"/"trust"/security keys, for CLIs
 #                                   with strict config schemas (e.g. Antigravity)
 
+# --- Login prompt watching ---
+# The wrapper watches each agent's terminal for login/authentication prompts
+# (expired session, first launch, revoked token). When one is detected, a
+# system message is posted in the chat UI so a human can attach to the
+# agent's terminal and complete the login; an all-clear is posted once the
+# prompt goes away. Per-agent options:
+#   login_watch = false               — disable the watcher for this agent
+#   login_patterns = ["extra regex"]  — additional patterns (case-insensitive)
+#                                       matched against the visible terminal
+
 # --- API agents (local models) ---
 # Add local model agents in config.local.toml (gitignored).
 # Example config.local.toml:
