@@ -55,6 +55,24 @@ def inject(text: str, *, tmux_session: str, delay: float = 0.3):
     )
 
 
+def get_screen_reader(session_name):
+    """Return a callable that captures the visible tmux pane text (or None)."""
+
+    def read_screen():
+        try:
+            result = subprocess.run(
+                ["tmux", "capture-pane", "-t", session_name, "-p"],
+                capture_output=True, timeout=2,
+            )
+            if result.returncode != 0:
+                return None
+            return result.stdout.decode("utf-8", errors="replace")
+        except Exception:
+            return None
+
+    return read_screen
+
+
 def get_activity_checker(session_name, trigger_flag=None):
     """Return a callable that detects tmux pane output by hashing content."""
     last_hash = [None]

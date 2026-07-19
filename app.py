@@ -336,6 +336,35 @@ def configure(cfg: dict, session_token: str = ""):
             except Exception:
                 pass
 
+            # Login-required flags: the wrapper detected the agent CLI sitting
+            # on an auth/login screen (session timeout or first launch) — the
+            # agent can't respond until a human logs in, so tell the owner.
+            try:
+                for flag in _data_dir.glob("*_login_required"):
+                    try:
+                        payload = json.loads(flag.read_text("utf-8"))
+                    except Exception:
+                        payload = {}
+                    flag.unlink()
+                    agent_name = payload.get("agent") or flag.name[: -len("_login_required")]
+                    detail = payload.get("detail", "")
+                    hint = payload.get("attach_hint", "")
+                    text = (
+                        f"⚠️ @{agent_name} needs a human: its CLI is waiting on a "
+                        f"login/authentication prompt"
+                        + (f' ("{detail}")' if detail else "")
+                        + ". It can't respond to mentions until someone completes "
+                          "the login in its terminal"
+                        + (f" — {hint}." if hint else ".")
+                    )
+                    store.add("system", text)
+                for flag in _data_dir.glob("*_login_resolved"):
+                    agent_name = flag.read_text("utf-8").strip() or flag.name[: -len("_login_resolved")]
+                    flag.unlink()
+                    store.add("system", f"✅ @{agent_name} login prompt cleared — back to normal.")
+            except Exception:
+                pass
+
             # Pending instances (slot 2+) wait for human naming or agent claim.
             # No auto-confirm — identity must be explicitly resolved.
 

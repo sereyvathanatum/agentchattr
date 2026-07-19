@@ -906,15 +906,55 @@ def main():
     _agent_pid = [None]
 
     if sys.platform == "win32":
-        from wrapper_windows import get_activity_checker, run_agent
+        from wrapper_windows import get_activity_checker, get_screen_reader, run_agent
 
         _set_activity_checker(get_activity_checker(_agent_pid, agent_name=assigned_name, trigger_flag=_trigger_flag))
+        _screen_reader = get_screen_reader()
+        _attach_hint = "check the agent's terminal window"
     else:
-        from wrapper_unix import get_activity_checker, run_agent
+        from wrapper_unix import get_activity_checker, get_screen_reader, run_agent
 
         session_prefix = os.environ.get("AGENTCHATTR_SESSION_PREFIX") or "agentchattr"
         unix_session_name = f"{session_prefix}-{assigned_name}"
         _set_activity_checker(get_activity_checker(unix_session_name, trigger_flag=_trigger_flag))
+        _screen_reader = get_screen_reader(unix_session_name)
+        _attach_hint = f"tmux attach -t {unix_session_name}"
+
+    # Login prompt watcher: if the agent CLI stops on an auth/login screen
+    # (session timeout or first launch), flag the server so the owner is
+    # notified in the chat UI and can complete the login in the terminal.
+    if agent_cfg.get("login_watch", True):
+        from login_detect import (
+            LoginPromptDetector,
+            write_login_required_flag,
+            write_login_resolved_flag,
+        )
+
+        def _login_watcher():
+            detector = LoginPromptDetector(
+                extra_patterns=agent_cfg.get("login_patterns", []))
+            while True:
+                time.sleep(3)
+                try:
+                    screen = _screen_reader()
+                    if screen is None:
+                        continue
+                    event = detector.poll(screen)
+                    if not event:
+                        continue
+                    current_name, _ = get_identity()
+                    kind, detail = event
+                    if kind == "login_required":
+                        print(f"  Login prompt detected — notifying chat: {detail}")
+                        write_login_required_flag(
+                            data_dir, current_name, detail, _attach_hint)
+                    else:
+                        print("  Login prompt cleared.")
+                        write_login_resolved_flag(data_dir, current_name)
+                except Exception:
+                    pass
+
+        threading.Thread(target=_login_watcher, daemon=True).start()
 
     run_kwargs = dict(
         command=command,

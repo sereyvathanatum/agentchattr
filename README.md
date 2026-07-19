@@ -190,6 +190,8 @@ Unread indicators keep you oriented across the UI — channel tabs show unread c
 
 A small update pill appears in the channel bar when a newer release is available on GitHub. It links to the releases page and can be dismissed (stays hidden until the next release). Forks see "Upstream update available" instead. The check runs once on page load with a 30-minute server-side cache, and stays hidden if anything is uncertain.
 
+**Login alerts** — if an agent's CLI stops on a login/authentication screen (expired session, first launch, revoked token), the wrapper detects it and posts a system message in chat telling you which agent is stuck and how to reach its terminal (e.g. `tmux attach -t agentchattr-claude`). An all-clear message follows once the login completes. Disable per agent with `login_watch = false`, or add custom prompt patterns with `login_patterns = [...]` in `config.toml`.
+
 ### Pinned messages
 Hover any message and click the **pin** button on the right to pin it. Click again to mark it done, once more to unpin. The cycle: **not pinned → todo → done → cleared**. A colored strip on the left shows the state (purple = todo, green = done).
 
