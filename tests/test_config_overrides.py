@@ -23,6 +23,9 @@ ENV_VARS = [
     "AGENTCHATTR_MCP_HTTP_PORT",
     "AGENTCHATTR_MCP_SSE_PORT",
     "AGENTCHATTR_UPLOAD_DIR",
+    "AGENTCHATTR_CWD",
+    "AGENTCHATTR_SESSION_PREFIX",
+    "AGENTCHATTR_MCP_SERVER_NAME",
 ]
 
 
@@ -169,6 +172,29 @@ class CliOverrideExtractionTests(unittest.TestCase):
         self.assertEqual(os.environ["AGENTCHATTR_MCP_HTTP_PORT"], "8210")
         self.assertEqual(os.environ["AGENTCHATTR_MCP_SSE_PORT"], "8211")
         self.assertEqual(os.environ["AGENTCHATTR_UPLOAD_DIR"], "/tmp/proj-uploads")
+
+    def test_wrapper_only_flags_extracted(self):
+        # --cwd/--session-prefix/--mcp-server-name are env-passthrough only
+        # (consumed by wrapper.py, not config.toml keys).
+        argv = [
+            "wrapper.py", "agy",
+            "--cwd", "/home/user/projects/myapp",
+            "--session-prefix", "agentchattr-myapp-1a2b3c4d",
+            "--mcp-server-name", "agentchattr-myapp-1a2b3c4d",
+        ]
+        config_loader.apply_cli_overrides(argv)
+        self.assertEqual(os.environ["AGENTCHATTR_CWD"], "/home/user/projects/myapp")
+        self.assertEqual(os.environ["AGENTCHATTR_SESSION_PREFIX"], "agentchattr-myapp-1a2b3c4d")
+        self.assertEqual(os.environ["AGENTCHATTR_MCP_SERVER_NAME"], "agentchattr-myapp-1a2b3c4d")
+
+    def test_wrapper_only_flags_do_not_touch_config(self):
+        # The three wrapper-only env vars must not leak into config.toml keys.
+        os.environ["AGENTCHATTR_CWD"] = "/somewhere"
+        os.environ["AGENTCHATTR_SESSION_PREFIX"] = "prefix-x"
+        os.environ["AGENTCHATTR_MCP_SERVER_NAME"] = "name-x"
+        config = config_loader.load_config(ROOT)
+        self.assertEqual(config["server"]["port"], 8300)
+        self.assertEqual(config["server"]["data_dir"], "./data")
 
     def test_pass_through_separator_ignores_later_flags(self):
         # `-- --port 9999` belongs to the agent CLI, not agentchattr.

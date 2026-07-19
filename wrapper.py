@@ -29,6 +29,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).parent
 
+# mcpServers key used when injecting MCP settings into agent CLI configs.
+# Per-project isolated instances override this via AGENTCHATTR_MCP_SERVER_NAME
+# (set in main()) so shared per-user settings files (e.g. Antigravity's
+# ~/.gemini/config/mcp_config.json) hold one entry per instance instead of
+# clobbering each other.
 SERVER_NAME = "agentchattr"
 
 
@@ -102,8 +107,12 @@ def _read_project_mcp_servers(project_dir: Path) -> dict:
         try:
             data = json.loads(mcp_file.read_text("utf-8"))
             servers = data.get("mcpServers", {})
-            # Remove agentchattr — we'll add our own authenticated version
-            servers.pop(SERVER_NAME, None)
+            # Remove agentchattr entries (ours and any other instance's) —
+            # we'll add our own authenticated version
+            servers = {
+                name: cfg for name, cfg in servers.items()
+                if name != SERVER_NAME and not name.startswith("agentchattr")
+            }
             return servers
         except Exception:
             pass
@@ -518,12 +527,16 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                         except json.JSONDecodeError:
                             pass
 
+                    # Name the MCP server explicitly for per-project instances
+                    # so agents that see several agentchattr-* entries in a
+                    # shared settings file pick the right one.
+                    mcp_ref = "mcp" if SERVER_NAME == "agentchattr" else f'the "{SERVER_NAME}" mcp server'
                     if custom_prompt:
                         prompt = custom_prompt
                     elif job_id:
-                        prompt = f"use mcp to read job_id={job_id} - you're mentioned in a job thread, take appropriate action and respond"
+                        prompt = f"use {mcp_ref} to read job_id={job_id} - you're mentioned in a job thread, take appropriate action and respond"
                     else:
-                        prompt = f"use mcp to read #{channel} - you're mentioned, take appropriate action and respond"
+                        prompt = f"use {mcp_ref} to read #{channel} - you're mentioned, take appropriate action and respond"
 
                     # Use current identity (may have changed via rename)
                     current_name, _ = get_identity_fn()
@@ -583,6 +596,11 @@ def main():
     apply_cli_overrides()
     config = load_config(ROOT)
 
+    # Per-project instances use a unique mcpServers key so shared per-user
+    # settings files (agy/copilot/codebuddy) hold one entry per instance.
+    global SERVER_NAME
+    SERVER_NAME = os.environ.get("AGENTCHATTR_MCP_SERVER_NAME") or "agentchattr"
+
     agent_names = list(config.get("agents", {}).keys())
 
     parser = argparse.ArgumentParser(description="Agent wrapper with chat auto-trigger")
@@ -597,11 +615,25 @@ def main():
     parser.add_argument("--mcp-http-port", default=None, help="Override mcp.http_port (int)")
     parser.add_argument("--mcp-sse-port",  default=None, help="Override mcp.sse_port (int)")
     parser.add_argument("--upload-dir",    default=None, help="Override images.upload_dir (path)")
+    parser.add_argument("--cwd",             default=None, help="Override the agent's working directory (path)")
+    parser.add_argument("--session-prefix",  default=None, help="tmux session name prefix (default: agentchattr)")
+    parser.add_argument("--mcp-server-name", default=None, help="mcpServers key for injected MCP settings (default: agentchattr)")
+    parser.add_argument("--no-attach", action="store_true",
+                        help="Headless mode: don't attach to the agent's tmux session (for daemonized wrappers)")
     args, extra = parser.parse_known_args()
 
     agent = args.agent
     agent_cfg = config.get("agents", {}).get(agent, {})
-    cwd = agent_cfg.get("cwd", ".")
+    # Project dir: AGENTCHATTR_CWD (set by --cwd or the agentchattr CLI)
+    # overrides the per-agent config.toml `cwd`. Override paths resolve
+    # against the invoking shell's cwd; config.toml paths resolve against
+    # the install dir (ROOT), as before.
+    cwd_override = os.environ.get("AGENTCHATTR_CWD", "")
+    if cwd_override:
+        _p = Path(cwd_override).expanduser()
+        project_dir = (_p if _p.is_absolute() else Path.cwd() / _p).resolve()
+    else:
+        project_dir = (ROOT / agent_cfg.get("cwd", ".")).resolve()
     command = agent_cfg.get("command", agent)
     data_dir = ROOT / config.get("server", {}).get("data_dir", "./data")
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -679,7 +711,7 @@ def main():
             _apply_mcp_inject(
                 inject_cfg, instance_name, data_dir, proxy_url,
                 token=new_token, mcp_cfg=mcp_cfg,
-                project_dir=(ROOT / cwd).resolve(),
+                project_dir=project_dir,
             )
         except Exception:
             pass
@@ -725,8 +757,6 @@ def main():
         sys.exit(1)
     command = resolved
 
-    project_dir = (ROOT / cwd).resolve()
-
     # Gemini: ensure the project directory is trusted so MCPs are allowed.
     # Gemini blocks ALL MCPs for untrusted folders — even system-settings ones.
     if agent == "gemini" or inject_cfg.get("mcp_inject") == "env":
@@ -753,7 +783,7 @@ def main():
     elif proxy_url:
         print(f"  Local MCP proxy: {proxy_url}")
     print(f"  @{assigned_name} mentions auto-inject MCP reads")
-    print(f"  Starting {command} in {cwd}...\n")
+    print(f"  Starting {command} in {project_dir}...\n")
 
     def _heartbeat():
         while True:
@@ -882,13 +912,14 @@ def main():
     else:
         from wrapper_unix import get_activity_checker, run_agent
 
-        unix_session_name = f"agentchattr-{assigned_name}"
+        session_prefix = os.environ.get("AGENTCHATTR_SESSION_PREFIX") or "agentchattr"
+        unix_session_name = f"{session_prefix}-{assigned_name}"
         _set_activity_checker(get_activity_checker(unix_session_name, trigger_flag=_trigger_flag))
 
     run_kwargs = dict(
         command=command,
         extra_args=launch_args,
-        cwd=cwd,
+        cwd=str(project_dir),
         env=env,
         queue_file=queue_file,
         agent=agent,
@@ -904,6 +935,7 @@ def main():
         run_kwargs["enter_backend"] = agent_cfg.get("enter_backend", "console_input")
     if sys.platform != "win32":
         run_kwargs["session_name"] = unix_session_name
+        run_kwargs["attach"] = not args.no_attach
 
     try:
         run_agent(**run_kwargs)

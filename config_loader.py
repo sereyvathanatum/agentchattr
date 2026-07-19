@@ -13,6 +13,18 @@ isolated instances per project without editing the repo's config file.
   AGENTCHATTR_MCP_SSE_PORT    → mcp.sse_port          (int)
   AGENTCHATTR_UPLOAD_DIR      → images.upload_dir
 
+Wrapper-only overrides (consumed directly by wrapper.py, not config keys):
+
+  AGENTCHATTR_CWD             → agent working directory (overrides every
+                                agent's `cwd` for this invocation)
+  AGENTCHATTR_SESSION_PREFIX  → tmux session name prefix (default
+                                "agentchattr"; per-project instances use a
+                                unique prefix so sessions never collide)
+  AGENTCHATTR_MCP_SERVER_NAME → mcpServers key used when injecting MCP
+                                settings (default "agentchattr"; per-project
+                                instances use a unique key so shared per-user
+                                settings files aren't clobbered)
+
 Relative paths in env var overrides resolve against the current working
 directory (where the user invoked the command from), not agentchattr's
 install directory.
@@ -42,6 +54,9 @@ CLI_OVERRIDE_FLAGS = [
     ("--mcp-http-port", "AGENTCHATTR_MCP_HTTP_PORT"),
     ("--mcp-sse-port",  "AGENTCHATTR_MCP_SSE_PORT"),
     ("--upload-dir",    "AGENTCHATTR_UPLOAD_DIR"),
+    ("--cwd",             "AGENTCHATTR_CWD"),
+    ("--session-prefix",  "AGENTCHATTR_SESSION_PREFIX"),
+    ("--mcp-server-name", "AGENTCHATTR_MCP_SERVER_NAME"),
 ]
 
 
