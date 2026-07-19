@@ -365,6 +365,69 @@ def configure(cfg: dict, session_token: str = ""):
             except Exception:
                 pass
 
+            # Quota-exhausted flags: the wrapper detected the agent CLI stuck
+            # on a usage-limit / out-of-credit screen. The agent can't announce
+            # this itself — sending a chat message costs the very quota that
+            # just ran out — so the server speaks on its behalf. Humans see it
+            # in the UI; other agents see it next time they read the channel.
+            # (Wording deliberately avoids quota_detect's detection patterns,
+            # and the quoted detail is sanitized — chat text can echo into
+            # other agents' terminals and must not re-trigger their watchers.)
+            try:
+                from quota_detect import sanitize_for_chat
+                for flag in _data_dir.glob("*_quota_exhausted"):
+                    try:
+                        payload = json.loads(flag.read_text("utf-8"))
+                    except Exception:
+                        payload = {}
+                    flag.unlink()
+                    agent_name = payload.get("agent") or flag.name[: -len("_quota_exhausted")]
+                    detail = payload.get("detail", "")
+                    hint = payload.get("attach_hint", "")
+                    reset_at = payload.get("reset_at")
+                    estimated = payload.get("reset_estimated", False)
+                    mcp_bridge.set_quota_exhausted(agent_name, detail, reset_at, estimated)
+                    if reset_at:
+                        reset_note = (
+                            f" Expected back around {_fmt_reset_time(reset_at)}"
+                            + (" (estimated)" if estimated else "")
+                            + "."
+                        )
+                    else:
+                        reset_note = ""
+                    text = (
+                        f"🪫 @{agent_name} is out of AI provider capacity and can't respond"
+                        + (f' — its terminal shows: "{sanitize_for_chat(detail)}"' if detail else "")
+                        + "."
+                        + reset_note
+                        + " Mentions will be queued for its return; don't wait on it"
+                          " for time-sensitive work."
+                        + (f" For exact reset details, attach to its terminal"
+                           f" (e.g. run /usage): {hint}." if hint else "")
+                    )
+                    store.add("system", text)
+                for flag in _data_dir.glob("*_quota_resolved"):
+                    agent_name = flag.read_text("utf-8").strip() or flag.name[: -len("_quota_resolved")]
+                    flag.unlink()
+                    mcp_bridge.clear_quota_exhausted(agent_name)
+                    store.add("system", f"✅ @{agent_name} has capacity again — back to normal.")
+            except Exception:
+                pass
+
+            # Quota reset watch: when an exhausted agent's expected reset time
+            # passes, clear the state and tell the room it should be usable.
+            try:
+                for agent_name, q_state in mcp_bridge.pop_expired_quota_resets():
+                    est = " (that was an estimate)" if q_state.get("estimated") else ""
+                    store.add(
+                        "system",
+                        f"⏰ @{agent_name}'s capacity window should have refreshed{est} — "
+                        "try mentioning it again. If it stays silent, check its terminal "
+                        "(e.g. run /usage) for the actual reset schedule."
+                    )
+            except Exception:
+                pass
+
             # Pending instances (slot 2+) wait for human naming or agent claim.
             # No auto-confirm — identity must be explicitly resolved.
 
@@ -686,6 +749,17 @@ def _resolve_draft_lineage(text: str, channel: str) -> tuple[str, int]:
     return str(uuid.uuid4())[:8], 1
 
 
+def _fmt_reset_time(ts: float) -> str:
+    """Human-readable local time for a quota reset, with date when not today."""
+    import time as _time
+    lt = _time.localtime(ts)
+    today = _time.localtime()
+    text = _time.strftime("%H:%M", lt)
+    if (lt.tm_year, lt.tm_yday) != (today.tm_year, today.tm_yday):
+        text = _time.strftime("%b %d ", lt) + text
+    return text
+
+
 async def _handle_new_message(msg: dict):
     """Broadcast message to web clients + check for @mention triggers."""
     # For broadcast slash commands, suppress the raw message — only the expanded
@@ -891,6 +965,21 @@ async def _handle_new_message(msg: dict):
             continue
         if not mcp_bridge.is_online(target):
             store.add("system", f"{target} appears offline — message queued.", msg_type="system", channel=channel)
+        # Warn (once per exhaustion) when someone pings an agent that's out
+        # of provider quota — it won't answer, and can't say so itself.
+        if mcp_bridge.is_quota_exhausted(target) and mcp_bridge.mark_quota_mention_notified(target):
+            q_state = mcp_bridge.get_quota_state(target) or {}
+            reset_at = q_state.get("reset_at")
+            when = (
+                f" until ~{_fmt_reset_time(reset_at)}"
+                + (" (estimated)" if q_state.get("estimated") else "")
+            ) if reset_at else ""
+            store.add(
+                "system",
+                f"🪫 @{target} is out of AI provider capacity and won't answer{when}. "
+                "Your message is queued for when it's back.",
+                msg_type="system", channel=channel,
+            )
         if agents.is_available(target):
             await agents.trigger(target, message=chat_msg, channel=channel, prompt=custom_prompt)
 
