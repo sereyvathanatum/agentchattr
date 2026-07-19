@@ -6,6 +6,7 @@ Usage:
     python wrapper.py gemini
     python wrapper.py kimi
     python wrapper.py qwen
+    python wrapper.py agy
 
 Cross-platform:
   - Windows: injects keystrokes via Win32 WriteConsoleInput (wrapper_windows.py)
@@ -36,7 +37,8 @@ SERVER_NAME = "agentchattr"
 # ---------------------------------------------------------------------------
 
 def _write_json_mcp_settings(config_file: Path, url: str, transport: str = "http",
-                              *, token: str = "", http_key: str = "httpUrl") -> Path:
+                              *, token: str = "", http_key: str = "httpUrl",
+                              style: str = "gemini") -> Path:
     """Write/merge a settings-style JSON file with nested mcpServers config.
 
     Preserves existing servers in the file — only updates the agentchattr entry.
@@ -51,6 +53,14 @@ def _write_json_mcp_settings(config_file: Path, url: str, transport: str = "http
     standard MCP shape should set `mcp_http_key = "url"` in their config.
     Only affects settings_file / env injector modes (not the Claude flag
     writer or Kilo env_content writer).
+
+    `style` controls the overall entry shape:
+      - "gemini" (default): settings-file entry with "type"/"trust" keys plus
+        a top-level security.folderTrust block.
+      - "plain": bare MCP entry — just the URL key (+ optional headers), no
+        "type"/"trust", and no security block. For providers with strict
+        config schemas (e.g. Antigravity's mcp_config.json, whose server
+        spec only knows serverUrl/command/headers/...).
     """
     config_file.parent.mkdir(parents=True, exist_ok=True)
     existing: dict = {}
@@ -62,8 +72,10 @@ def _write_json_mcp_settings(config_file: Path, url: str, transport: str = "http
     servers = existing.get("mcpServers", {})
     # Default: Gemini-style "httpUrl" for HTTP. Override with http_key="url"
     # for providers that follow the standard MCP shape (e.g. CodeBuddy).
-    if transport in ("http", "streamable-http"):
-        entry: dict = {"type": "http", http_key: url, "trust": True}
+    if style == "plain":
+        entry: dict = {http_key: url}
+    elif transport in ("http", "streamable-http"):
+        entry = {"type": "http", http_key: url, "trust": True}
     else:
         entry = {"type": transport, "url": url, "trust": True}
     if token:
@@ -71,12 +83,13 @@ def _write_json_mcp_settings(config_file: Path, url: str, transport: str = "http
     servers[SERVER_NAME] = entry
     existing["mcpServers"] = servers
 
-    # Enable folder trust so ~/.gemini/trustedFolders.json is respected
-    security = existing.get("security", {})
-    folder_trust = security.get("folderTrust", {})
-    folder_trust["enabled"] = True
-    security["folderTrust"] = folder_trust
-    existing["security"] = security
+    if style != "plain":
+        # Enable folder trust so ~/.gemini/trustedFolders.json is respected
+        security = existing.get("security", {})
+        folder_trust = security.get("folderTrust", {})
+        folder_trust["enabled"] = True
+        security["folderTrust"] = folder_trust
+        existing["security"] = security
 
     config_file.write_text(json.dumps(existing, indent=2) + "\n", "utf-8")
     return config_file
@@ -211,6 +224,7 @@ def _apply_mcp_inject(
     server_url = _get_server_url(mcp_cfg or {}, transport)
 
     http_key = inject_cfg.get("mcp_http_key", "httpUrl")
+    settings_style = inject_cfg.get("mcp_settings_style", "gemini")
 
     if mode == "settings_file":
         # Write a settings JSON file at a user-specified path (e.g. .qwen/settings.json,
@@ -226,7 +240,8 @@ def _apply_mcp_inject(
             target = base / target
         settings_path = _write_json_mcp_settings(target, server_url,
                                                   transport=transport, token=token,
-                                                  http_key=http_key)
+                                                  http_key=http_key,
+                                                  style=settings_style)
         # Optionally set an env var pointing to the settings file
         env_var = inject_cfg.get("mcp_env_var")
         if env_var:
@@ -401,10 +416,9 @@ def _notify_recovery(data_dir: Path, agent_name: str):
 
 
 _IDENTITY_HINT = (
-    " (If this is a multi-instance session, reclaim your previous identity from "
-    "your context window, NOT from the chat history before responding. If you "
-    "didn't have one, tell the user to give you a name by clicking your status "
-    "pill at the top.)"
+    " (You are \"{name}\" in a multi-instance session. The server already knows "
+    "your identity from your auth token, so just respond normally via chat_send — "
+    "do not ask the user for a name and do not reclaim an identity from chat history.)"
 )
 
 
@@ -540,7 +554,7 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                             _report_rule_sync(server_port, current_name, rules_data["epoch"], _token)
 
                     if first_mention and is_multi_instance:
-                        prompt += _IDENTITY_HINT
+                        prompt += _IDENTITY_HINT.format(name=current_name)
                         first_mention = False
                     # Flatten to single line — multi-line text triggers paste
                     # detection in CLIs (Claude Code shows "[Pasted text +N]")

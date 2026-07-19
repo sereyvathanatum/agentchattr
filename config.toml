@@ -68,6 +68,17 @@ mcp_transport = "http"
 mcp_http_key = "url"
 enter_backend = "wm_setfocus"
 
+[agents.agy]
+command = "agy"
+cwd = ".."
+color = "#00bcd4"
+label = "Antigravity"
+mcp_inject = "settings_file"
+mcp_settings_path = "~/.gemini/config/mcp_config.json"
+mcp_settings_style = "plain"
+mcp_http_key = "serverUrl"
+mcp_transport = "http"
+
 [agents.minimax]
 type = "api"
 base_url = "https://api.minimax.io/v1"
@@ -116,6 +127,13 @@ max_size_mb = 10
 #   mcp_inject = "env"
 #   mcp_env_var = "MYCLI_MCP_SETTINGS"
 #   mcp_transport = "http"
+#
+# Optional settings_file tweaks:
+#   mcp_http_key = "url"          — JSON key for the server URL (default "httpUrl";
+#                                   CodeBuddy/Copilot use "url", Antigravity "serverUrl")
+#   mcp_settings_style = "plain"  — write a bare {<key>: url, headers: ...} entry
+#                                   without "type"/"trust"/security keys, for CLIs
+#                                   with strict config schemas (e.g. Antigravity)
 
 # --- API agents (local models) ---
 # Add local model agents in config.local.toml (gitignored).

@@ -63,6 +63,35 @@ class JsonMcpSettingsTests(unittest.TestCase):
         entry = self._read()["mcpServers"]["agentchattr"]
         self.assertEqual(entry["headers"]["Authorization"], "Bearer secret-token-123")
 
+    def test_plain_style_writes_bare_entry(self):
+        # Antigravity-style: strict schema, only the URL key + headers allowed
+        _write_json_mcp_settings(self.target, "http://127.0.0.1:8200/mcp",
+                                 transport="http", token="tok-1",
+                                 http_key="serverUrl", style="plain")
+        data = self._read()
+        entry = data["mcpServers"]["agentchattr"]
+        self.assertEqual(entry["serverUrl"], "http://127.0.0.1:8200/mcp")
+        self.assertEqual(entry["headers"]["Authorization"], "Bearer tok-1")
+        self.assertNotIn("type", entry)
+        self.assertNotIn("trust", entry)
+        # No Gemini security block injected into a strict-schema config file
+        self.assertNotIn("security", data)
+
+    def test_plain_style_preserves_existing_stdio_servers(self):
+        # A real Antigravity mcp_config.json may hold command-based servers
+        self.target.write_text(json.dumps({
+            "mcpServers": {
+                "searxng": {"command": "npx", "args": ["-y", "mcp-searxng"]}
+            }
+        }))
+        _write_json_mcp_settings(self.target, "http://127.0.0.1:8200/mcp",
+                                 transport="http", http_key="serverUrl",
+                                 style="plain")
+        data = self._read()
+        self.assertEqual(data["mcpServers"]["searxng"]["command"], "npx")
+        self.assertEqual(data["mcpServers"]["agentchattr"]["serverUrl"],
+                         "http://127.0.0.1:8200/mcp")
+
     def test_existing_servers_preserved(self):
         # Write a pre-existing settings file with an unrelated server
         self.target.parent.mkdir(parents=True, exist_ok=True)

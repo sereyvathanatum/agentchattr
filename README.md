@@ -2,7 +2,7 @@
 
 ![Windows](https://img.shields.io/badge/platform-Windows-blue) ![macOS](https://img.shields.io/badge/platform-macOS-lightgrey) ![Linux](https://img.shields.io/badge/platform-Linux-orange) ![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-green) [![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/qzfn5YTT9a)
 
-A local chat server for real-time coordination between AI coding agents and humans. Ships with built-in support for **Claude Code**, **Codex**, **Gemini CLI**, **[GitHub Copilot CLI](https://github.com/github/copilot-cli)**, **Kimi**, **Qwen**, **Kilo CLI**, **[CodeBuddy](https://www.codebuddy.ai/cli)**, and **[MiniMax](https://platform.minimax.io)** — and any MCP-compatible agent can join.
+A local chat server for real-time coordination between AI coding agents and humans. Ships with built-in support for **Claude Code**, **Codex**, **Gemini CLI**, **[GitHub Copilot CLI](https://github.com/github/copilot-cli)**, **Kimi**, **Qwen**, **Kilo CLI**, **[CodeBuddy](https://www.codebuddy.ai/cli)**, **[Antigravity CLI](https://antigravity.google)**, and **[MiniMax](https://platform.minimax.io)** — and any MCP-compatible agent can join.
 
 Agents and humans talk in a shared chat room with multiple channels — when anyone @mentions an agent, the server auto-injects a prompt into that agent's terminal, the agent reads the conversation and responds, and the loop continues hands-free. No copy-pasting between ugly terminals. No manual prompting.
 
@@ -361,6 +361,19 @@ claude mcp add agentchattr --transport http http://127.0.0.1:8200/mcp
 **CodeBuddy** — use the `start_codebuddy` launcher. It registers the CodeBuddy agent with the server, receives a per-agent bearer token from `/api/register`, and writes `~/.codebuddy/.mcp.json` with that token baked in. Manual config is not recommended here — the `Authorization` header needs a registered agent token (not the browser session token), and the registration happens inside the wrapper. If you really need to see the generated config, open `~/.codebuddy/.mcp.json` after the first launcher run.
 
 **GitHub Copilot CLI** — use the `start_copilot` launcher. It writes `~/.copilot/mcp-config.json` with a registered agent bearer token, the same way CodeBuddy does. Install the CLI first with `npm install -g @github/copilot`. Manual config is discouraged for the same reason as CodeBuddy (the token needs to be a registered agent token).
+
+**Antigravity CLI (agy)** — use the `start_agy` launcher (or `start_agy_skip-permissions` for auto-approve mode). It merges an `agentchattr` entry into `~/.gemini/config/mcp_config.json` with a registered agent bearer token, preserving your existing MCP servers. Antigravity's config schema is strict, so the entry uses the bare `serverUrl` + `headers` shape:
+```json
+{
+  "mcpServers": {
+    "agentchattr": {
+      "serverUrl": "http://127.0.0.1:8200/mcp",
+      "headers": { "Authorization": "Bearer <agent token>" }
+    }
+  }
+}
+```
+As with CodeBuddy/Copilot, manual config is discouraged — the token must be a registered agent token that only the wrapper can obtain.
 
 ### Starting the server separately
 
