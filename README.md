@@ -485,10 +485,38 @@ python wrapper.py claude \
 - `AGENTCHATTR_MCP_HTTP_PORT` — overrides `mcp.http_port`
 - `AGENTCHATTR_MCP_SSE_PORT` — overrides `mcp.sse_port`
 - `AGENTCHATTR_UPLOAD_DIR` — overrides `images.upload_dir`
+- `AGENTCHATTR_CWD` — overrides every agent's `cwd` (`--cwd`, wrapper only)
+- `AGENTCHATTR_SESSION_PREFIX` — tmux session name prefix (`--session-prefix`, wrapper only)
+- `AGENTCHATTR_MCP_SERVER_NAME` — `mcpServers` key for injected MCP settings (`--mcp-server-name`, wrapper only)
 
 Relative paths resolve against the shell's current directory (not agentchattr's install location), so `./.agentchattr` ends up inside your project folder.
 
 Server and wrappers share the same `AGENTCHATTR_*` env vars and the same flag names, so a launcher/profile can run multiple isolated instances by passing matching values to each process. If no flags or env vars are set, `config.toml` is used exactly as before — zero change for existing setups.
+
+### Global install: swarms from any directory (Linux/Mac)
+
+Instead of wiring up the isolation flags by hand, install agentchattr once and launch a whole per-project swarm with one command from any directory:
+
+```bash
+git clone https://github.com/sereyvathanatum/agentchattr ~/.local/share/agentchattr
+~/.local/share/agentchattr/install.sh    # venv + `agentchattr` command on PATH, no sudo
+```
+
+Then, from any project:
+
+```bash
+cd ~/projects/myapp
+agentchattr up claude codex agy agy   # server + 4 agents, all working in ~/projects/myapp
+agentchattr status                    # what's running here (add --all for every project)
+agentchattr attach agy-2              # watch an agent live (Ctrl+B, D detaches)
+agentchattr logs w1-claude            # tail a wrapper's log
+agentchattr ui                        # open this project's chat UI
+agentchattr down                      # stop this project's swarm (--purge deletes its data)
+```
+
+Every `up` gives the project a fully isolated instance: its own server + MCP ports (allocated deterministically from the project path, starting at 8310 so the classic launchers on 8300 coexist), its own data/uploads/logs under `~/.agentchattr/instances/<slug>/`, and its own tmux session prefix and MCP settings key so concurrent swarms in different projects never collide — even agents like Antigravity that share a per-user settings file. Repeat an agent name (`agy agy`) for multiple instances of the same CLI.
+
+Everything runs detached in tmux sessions: closing the terminal you ran `up` from stops nothing. `up` is idempotent — re-running it only starts what's missing (and restarts the server if it died). API-type agents (e.g. minimax) aren't supported by `up` yet; run `python wrapper_api.py <name>` with matching flags instead.
 
 ### API agents (local models)
 

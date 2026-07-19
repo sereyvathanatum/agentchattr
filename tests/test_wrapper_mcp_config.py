@@ -15,7 +15,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from wrapper import _write_json_mcp_settings  # noqa: E402
+import wrapper  # noqa: E402
+from wrapper import _read_project_mcp_servers, _write_json_mcp_settings  # noqa: E402
 
 
 class JsonMcpSettingsTests(unittest.TestCase):
@@ -103,6 +104,63 @@ class JsonMcpSettingsTests(unittest.TestCase):
         data = self._read()
         self.assertIn("some-other-server", data["mcpServers"])
         self.assertIn("agentchattr", data["mcpServers"])
+
+
+class ServerNameOverrideTests(unittest.TestCase):
+    """Per-project instances override wrapper.SERVER_NAME so shared per-user
+    settings files (e.g. Antigravity's mcp_config.json) hold one mcpServers
+    entry per instance instead of clobbering each other."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.target = Path(self.tmp.name) / "settings.json"
+        self._saved_name = wrapper.SERVER_NAME
+        self.addCleanup(lambda: setattr(wrapper, "SERVER_NAME", self._saved_name))
+
+    def _read(self):
+        return json.loads(self.target.read_text("utf-8"))
+
+    def test_settings_file_uses_overridden_key(self):
+        wrapper.SERVER_NAME = "agentchattr-myapp-1a2b3c4d"
+        _write_json_mcp_settings(self.target, "http://127.0.0.1:8461/mcp",
+                                 transport="http", http_key="serverUrl",
+                                 style="plain")
+        data = self._read()
+        self.assertIn("agentchattr-myapp-1a2b3c4d", data["mcpServers"])
+        self.assertNotIn("agentchattr", data["mcpServers"])
+
+    def test_two_instances_coexist_in_shared_file(self):
+        # Two projects injecting into the same per-user file must not clobber
+        # each other's entries.
+        wrapper.SERVER_NAME = "agentchattr-projA-aaaaaaaa"
+        _write_json_mcp_settings(self.target, "http://127.0.0.1:8461/mcp",
+                                 transport="http", http_key="serverUrl",
+                                 style="plain")
+        wrapper.SERVER_NAME = "agentchattr-projB-bbbbbbbb"
+        _write_json_mcp_settings(self.target, "http://127.0.0.1:8471/mcp",
+                                 transport="http", http_key="serverUrl",
+                                 style="plain")
+        servers = self._read()["mcpServers"]
+        self.assertEqual(servers["agentchattr-projA-aaaaaaaa"]["serverUrl"],
+                         "http://127.0.0.1:8461/mcp")
+        self.assertEqual(servers["agentchattr-projB-bbbbbbbb"]["serverUrl"],
+                         "http://127.0.0.1:8471/mcp")
+
+    def test_project_servers_strip_all_agentchattr_entries(self):
+        # .mcp.json entries from ANY agentchattr instance are dropped when
+        # merging project servers — we always add our own authenticated one.
+        project = Path(self.tmp.name)
+        (project / ".mcp.json").write_text(json.dumps({
+            "mcpServers": {
+                "unity-mcp": {"type": "http", "url": "http://unity"},
+                "agentchattr": {"type": "http", "url": "http://stale-default"},
+                "agentchattr-other-11112222": {"type": "http", "url": "http://stale-other"},
+            }
+        }))
+        wrapper.SERVER_NAME = "agentchattr-myapp-1a2b3c4d"
+        servers = _read_project_mcp_servers(project)
+        self.assertEqual(list(servers), ["unity-mcp"])
 
 
 class ExpanduserPathTests(unittest.TestCase):
