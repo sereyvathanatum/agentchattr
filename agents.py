@@ -16,7 +16,7 @@ class AgentTrigger:
         return self._registry.is_registered(name)
 
     def get_status(self) -> dict:
-        from mcp_bridge import is_online, is_active, get_role
+        from mcp_bridge import is_online, is_active, get_role, get_quota_state
         instances = self._registry.get_all()
         return {
             name: {
@@ -25,6 +25,9 @@ class AgentTrigger:
                 "label": info["label"],
                 "color": info["color"],
                 "role": get_role(name),
+                # None when healthy; {"detail", "reset_at", "estimated", ...}
+                # when the wrapper reported the CLI stuck on a limit screen
+                "quota_exhausted": get_quota_state(name),
             }
             for name, info in instances.items()
         }

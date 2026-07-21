@@ -920,6 +920,12 @@ def main():
         _screen_reader = get_screen_reader(unix_session_name)
         _attach_hint = f"tmux attach -t {unix_session_name}"
 
+    # Screen watchers: poll the agent's visible terminal for states the agent
+    # can't report itself — auth/login prompts and quota exhaustion. Both
+    # detectors share one capture per poll; each writes a flag file that the
+    # server turns into a chat system message.
+    _screen_detectors = []  # (detector, handler(kind, detail, screen)) pairs
+
     # Login prompt watcher: if the agent CLI stops on an auth/login screen
     # (session timeout or first launch), flag the server so the owner is
     # notified in the chat UI and can complete the login in the terminal.
@@ -930,31 +936,75 @@ def main():
             write_login_resolved_flag,
         )
 
-        def _login_watcher():
-            detector = LoginPromptDetector(
-                extra_patterns=agent_cfg.get("login_patterns", []))
+        def _on_login_event(kind, detail, screen):
+            current_name, _ = get_identity()
+            if kind == "login_required":
+                print(f"  Login prompt detected — notifying chat: {detail}")
+                write_login_required_flag(data_dir, current_name, detail, _attach_hint)
+            else:
+                print("  Login prompt cleared.")
+                write_login_resolved_flag(data_dir, current_name)
+
+        _screen_detectors.append((
+            LoginPromptDetector(extra_patterns=agent_cfg.get("login_patterns", [])),
+            _on_login_event,
+        ))
+
+    # Quota watcher: when the agent runs out of provider quota (usage limit,
+    # rate limit, credits) it can't announce it — the MCP call to send a
+    # message is blocked by the very limit it hit. The wrapper detects the
+    # limit screen instead, parses the reset time when the CLI prints one
+    # ("resets 3am", "try again in 4 hours"), and flags the server to speak
+    # on the agent's behalf. quota_reset_hours in config.toml provides a
+    # fallback estimate for CLIs that don't print a reset time (e.g. 5 for
+    # Claude's rolling 5-hour window).
+    if agent_cfg.get("quota_watch", True):
+        from quota_detect import (
+            QuotaLimitDetector,
+            parse_reset_time,
+            write_quota_exhausted_flag,
+            write_quota_resolved_flag,
+        )
+
+        _quota_reset_hours = agent_cfg.get("quota_reset_hours", 0)
+
+        def _on_quota_event(kind, detail, screen):
+            current_name, _ = get_identity()
+            if kind == "quota_exhausted":
+                reset_at = parse_reset_time(screen)
+                estimated = False
+                if reset_at is None and _quota_reset_hours:
+                    reset_at = time.time() + _quota_reset_hours * 3600
+                    estimated = True
+                print(f"  Quota/usage limit detected — notifying chat: {detail}")
+                write_quota_exhausted_flag(
+                    data_dir, current_name, detail, _attach_hint,
+                    reset_at=reset_at, reset_estimated=estimated)
+            else:
+                print("  Quota/usage limit message cleared.")
+                write_quota_resolved_flag(data_dir, current_name)
+
+        _screen_detectors.append((
+            QuotaLimitDetector(extra_patterns=agent_cfg.get("quota_patterns", [])),
+            _on_quota_event,
+        ))
+
+    if _screen_detectors:
+        def _screen_watcher():
             while True:
                 time.sleep(3)
                 try:
                     screen = _screen_reader()
                     if screen is None:
                         continue
-                    event = detector.poll(screen)
-                    if not event:
-                        continue
-                    current_name, _ = get_identity()
-                    kind, detail = event
-                    if kind == "login_required":
-                        print(f"  Login prompt detected — notifying chat: {detail}")
-                        write_login_required_flag(
-                            data_dir, current_name, detail, _attach_hint)
-                    else:
-                        print("  Login prompt cleared.")
-                        write_login_resolved_flag(data_dir, current_name)
+                    for detector, handler in _screen_detectors:
+                        event = detector.poll(screen)
+                        if event:
+                            handler(event[0], event[1], screen)
                 except Exception:
                     pass
 
-        threading.Thread(target=_login_watcher, daemon=True).start()
+        threading.Thread(target=_screen_watcher, daemon=True).start()
 
     run_kwargs = dict(
         command=command,

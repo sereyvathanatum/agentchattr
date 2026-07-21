@@ -48,6 +48,12 @@ PRESENCE_TIMEOUT = 10  # ~2 missed heartbeats (5s interval) = offline
 _roles: dict[str, str] = {}  # agent_name → role string
 _ROLES_FILE: Path | None = None
 
+# Quota exhaustion — set by the server's flag checker when a wrapper reports
+# its CLI stuck on a usage-limit screen. In-memory only (like presence):
+# state entries are {"detail", "reset_at", "estimated", "mention_notified"}.
+_quota_lock = threading.Lock()
+_quota_exhausted: dict[str, dict] = {}
+
 # Cursor persistence — set by run.py to enable saving cursors across restarts
 _CURSORS_FILE: Path | None = None
 
@@ -498,6 +504,57 @@ def get_all_roles() -> dict[str, str]:
     return dict(_roles)
 
 
+def set_quota_exhausted(name: str, detail: str = "",
+                        reset_at: float | None = None,
+                        estimated: bool = False):
+    """Mark an agent as out of provider quota (from a wrapper flag file)."""
+    with _quota_lock:
+        _quota_exhausted[name] = {
+            "detail": detail,
+            "reset_at": reset_at,
+            "estimated": estimated,
+            "mention_notified": False,
+        }
+
+
+def clear_quota_exhausted(name: str) -> bool:
+    """Clear an agent's quota-exhausted state. Returns True if it was set."""
+    with _quota_lock:
+        return _quota_exhausted.pop(name, None) is not None
+
+
+def is_quota_exhausted(name: str) -> bool:
+    with _quota_lock:
+        return name in _quota_exhausted
+
+
+def get_quota_state(name: str) -> dict | None:
+    with _quota_lock:
+        state = _quota_exhausted.get(name)
+        return dict(state) if state else None
+
+
+def mark_quota_mention_notified(name: str) -> bool:
+    """True the first time per exhaustion — dedupes the mention-time warning."""
+    with _quota_lock:
+        state = _quota_exhausted.get(name)
+        if state is None or state.get("mention_notified"):
+            return False
+        state["mention_notified"] = True
+        return True
+
+
+def pop_expired_quota_resets(now: float | None = None) -> list[tuple[str, dict]]:
+    """Remove and return agents whose expected quota-reset time has passed."""
+    now = time.time() if now is None else now
+    with _quota_lock:
+        expired = [(n, s) for n, s in _quota_exhausted.items()
+                   if s.get("reset_at") and now >= s["reset_at"]]
+        for name, _ in expired:
+            _quota_exhausted.pop(name, None)
+        return expired
+
+
 def migrate_identity(old_name: str, new_name: str):
     """Migrate all runtime state when an agent is renamed (presence, cursors, activity, roles)."""
     with _presence_lock:
@@ -514,6 +571,9 @@ def migrate_identity(old_name: str, new_name: str):
     if old_name in _roles:
         _roles[new_name] = _roles.pop(old_name)
         _save_roles()
+    with _quota_lock:
+        if old_name in _quota_exhausted:
+            _quota_exhausted[new_name] = _quota_exhausted.pop(old_name)
     _save_cursors()
 
 
@@ -528,6 +588,8 @@ def purge_identity(name: str):
     if name in _roles:
         del _roles[name]
         _save_roles()
+    with _quota_lock:
+        _quota_exhausted.pop(name, None)
     _save_cursors()
 
 

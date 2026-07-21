@@ -145,6 +145,23 @@ max_size_mb = 10
 #   login_patterns = ["extra regex"]  — additional patterns (case-insensitive)
 #                                       matched against the visible terminal
 
+# --- Quota / usage-limit watching ---
+# The wrapper also watches each agent's terminal for quota exhaustion
+# ("usage limit reached", "out of credits", rate limits, HTTP 429). An
+# agent that runs out of quota can't announce it — the MCP call to send a
+# final message is blocked by the very limit it hit — so the wrapper
+# detects the limit screen (costs no agent quota) and the server posts a
+# system message on the agent's behalf, including the reset time when the
+# CLI prints one ("resets 3am", "try again in 4 hours"). When the reset
+# time passes, the server posts that the agent should be usable again.
+# Per-agent options:
+#   quota_watch = false               — disable the watcher for this agent
+#   quota_patterns = ["extra regex"]  — additional patterns (case-insensitive)
+#   quota_reset_hours = 5             — fallback reset estimate (hours) when
+#                                       the CLI doesn't print a reset time,
+#                                       e.g. 5 for Claude's rolling 5-hour
+#                                       window. 0/unset = no estimate.
+
 # --- API agents (local models) ---
 # Add local model agents in config.local.toml (gitignored).
 # Example config.local.toml:

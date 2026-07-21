@@ -54,19 +54,26 @@ CLEAR_POLLS = 5
 _DETAIL_MAX_LEN = 120
 
 
-class LoginPromptDetector:
+class ScreenPatternDetector:
     """State machine over successive terminal snapshots.
 
+    Generic base: watches for any of `patterns` in the visible screen text
+    and reports `event_name` once the match persists for `confirm_polls`
+    consecutive polls, then "resolved" after `clear_polls` clean polls.
+    Subclassed by LoginPromptDetector (here) and QuotaLimitDetector
+    (quota_detect.py).
+
     poll(screen_text) returns:
-      ("login_required", detail)  — prompt confirmed; notify the owner once
-      ("resolved", "")            — previously reported prompt has cleared
-      None                        — no state change
+      (event_name, detail)  — pattern confirmed; notify the owner once
+      ("resolved", "")      — previously reported state has cleared
+      None                  — no state change
     """
 
-    def __init__(self, extra_patterns=None, confirm_polls: int = CONFIRM_POLLS,
+    def __init__(self, patterns, event_name: str,
+                 confirm_polls: int = CONFIRM_POLLS,
                  clear_polls: int = CLEAR_POLLS):
-        patterns = list(DEFAULT_LOGIN_PATTERNS) + list(extra_patterns or [])
         self._patterns = [re.compile(p, re.IGNORECASE) for p in patterns]
+        self._event_name = event_name
         self._confirm_polls = max(1, confirm_polls)
         self._clear_polls = max(1, clear_polls)
         self._notified = False
@@ -94,7 +101,7 @@ class LoginPromptDetector:
                 if self._hits >= self._confirm_polls:
                     self._notified = True
                     self._misses = 0
-                    return ("login_required", detail)
+                    return (self._event_name, detail)
             else:
                 self._hits = 0
         else:
@@ -107,6 +114,23 @@ class LoginPromptDetector:
                     self._hits = 0
                     return ("resolved", "")
         return None
+
+
+class LoginPromptDetector(ScreenPatternDetector):
+    """Detects interactive login/auth prompts in agent terminals.
+
+    poll(screen_text) returns:
+      ("login_required", detail)  — prompt confirmed; notify the owner once
+      ("resolved", "")            — previously reported prompt has cleared
+      None                        — no state change
+    """
+
+    def __init__(self, extra_patterns=None, confirm_polls: int = CONFIRM_POLLS,
+                 clear_polls: int = CLEAR_POLLS):
+        super().__init__(
+            list(DEFAULT_LOGIN_PATTERNS) + list(extra_patterns or []),
+            "login_required", confirm_polls, clear_polls,
+        )
 
 
 # ---------------------------------------------------------------------------
