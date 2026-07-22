@@ -27,6 +27,8 @@ def _parse_args():
     parser.add_argument("--mcp-http-port", default=None, help="Override mcp.http_port (int)")
     parser.add_argument("--mcp-sse-port",  default=None, help="Override mcp.sse_port (int)")
     parser.add_argument("--upload-dir",    default=None, help="Override images.upload_dir (path)")
+    parser.add_argument("--cwd",           default=None,
+                        help="Project directory to read agentchattr.toml from (path)")
     parser.add_argument("--allow-network", action="store_true",
                         help="Allow binding to non-localhost hosts (with confirmation).")
     return parser.parse_args()
@@ -44,7 +46,7 @@ def main():
     # wrappers use identical extraction logic.
     _parse_args()
 
-    from config_loader import apply_cli_overrides, load_config
+    from config_loader import apply_cli_overrides, load_config, resolve_project_dir
     apply_cli_overrides()
 
     config_path = ROOT / "config.toml"
@@ -52,7 +54,11 @@ def main():
         print(f"Error: {config_path} not found")
         sys.exit(1)
 
-    config = load_config(ROOT)
+    # The project dir (from --cwd) is where a project-local agentchattr.toml
+    # lives. The server must merge it for the same reason the wrappers do: it
+    # seeds the instance registry, and an agent the registry doesn't know is an
+    # agent no wrapper can register as. None when launched without --cwd.
+    config = load_config(ROOT, project_dir=resolve_project_dir())
 
     # --- Security: generate a random session token (in-memory only) ---
     session_token = secrets.token_hex(32)

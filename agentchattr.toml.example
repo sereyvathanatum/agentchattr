@@ -1,0 +1,139 @@
+# agentchattr.toml — project-scoped extra agents
+#
+# Copy this file to agentchattr.toml in the project directory you run
+# `agentchattr up` from (NOT the agentchattr install dir). The file name must
+# be exactly "agentchattr.toml" — a config.toml in your project is ignored.
+#
+# It's merged into the agents from the install's config.toml/config.local.toml
+# and takes precedence: it can add new agent names AND override existing ones
+# (claude, codex, agy, ...) to pin a different model or extra launch flags.
+#
+# Overrides are WHOLE-TABLE, not per-key: a [agents.agy] block here replaces
+# the install's [agents.agy] outright. Every key you don't restate is dropped,
+# not inherited — so copy the full block from config.toml and edit it, rather
+# than listing only the keys you want to change.
+#
+# Usage:
+#   1. cd ~/projects/myapp
+#   2. cp /path/to/agentchattr/agentchattr.toml.example agentchattr.toml
+#   3. Edit the [agents.NAME] section below
+#   4. agentchattr up agy2   (or list it alongside other agents)
+#
+# Same schema as [agents.*] in config.toml — see that file's "Launch args,
+# modes, model & effort" and "MCP injection modes" comments for the full
+# field reference (args, modes, model_flag_template, mcp_inject, ...).
+
+# --- Example: a second Antigravity instance, always auto-approving ---
+#
+# `command` names ONE executable — it's exec'd directly, with no shell, so a
+# "VAR=val agy" prefix would be read as part of the program's name and fail to
+# resolve. Set environment with the `env` table instead (below): giving the
+# agent its own HOME is how you run a second profile of a CLI that stores its
+# login under HOME, so agy and agy2 can be signed in to different accounts.
+# `mcp_settings_path`'s ~ expands against that HOME, not yours.
+#
+# [agents.agy2]
+# command = "agy"
+# cwd = ".."
+# color = "#00838f"
+# label = "Antigravity 2"
+# mcp_inject = "settings_file"
+# mcp_settings_path = "~/.gemini/config/mcp_config.json"
+# mcp_settings_style = "plain"
+# mcp_http_key = "serverUrl"
+# mcp_transport = "http"
+# args = ["--dangerously-skip-permissions"]
+#
+# [agents.agy2.env]
+# HOME = "/home/you/.agy-profiles/agy2"
+
+# --- Example: a third Antigravity instance, pinned to a specific model ---
+# [agents.agy3]
+# command = "agy"
+# cwd = ".."
+# color = "#6a1b9a"
+# label = "Antigravity 3"
+# mcp_inject = "settings_file"
+# mcp_settings_path = "~/.gemini/config/mcp_config.json"
+# mcp_settings_style = "plain"
+# mcp_http_key = "serverUrl"
+# mcp_transport = "http"
+# model_flag_template = "--model {model}"
+# model = "gemini-3-pro"
+
+# =====================================================================
+# Overriding an agent the install already defines
+# =====================================================================
+# The blocks below replace claude/codex/agy from the install's config.toml.
+# Two mistakes to avoid — both fail quietly or confusingly:
+#
+#   * flags do NOT go in `command`. It's resolved with shutil.which(), so
+#     "agy --dangerously-skip-permissions" fails as "not found on PATH".
+#     Put them in `args`.
+#   * model_flag_template needs a {model} placeholder AND a `model` value.
+#     A template alone is never rendered (nothing to substitute), and a
+#     hardcoded name in the template makes `--model` on the CLI a no-op.
+#
+# Because overrides are whole-table, the `modes` sub-tables are restated
+# here too — omit them and `agentchattr up claude:yolo` fails as an
+# unknown mode.
+#
+# Careful: a mode's `args` are APPENDED to the agent's, not swapped in. So
+# `claude:yolo` below launches with BOTH "--permission-mode auto" and
+# "--dangerously-skip-permissions", and whichever the CLI resolves last
+# wins. If a mode is meant to replace the base behaviour, leave the
+# agent-level `args` off and put the default in its own mode instead.
+
+# --- Example: override "claude" — auto-approve edits, pin model + effort ---
+# --permission-mode: acceptEdits | auto | bypassPermissions | manual | dontAsk | plan
+# --effort:          low | medium | high | xhigh | max
+#
+# [agents.claude]
+# command = "claude"
+# cwd = ".."
+# color = "#da7756"
+# label = "Claude"
+# args = ["--permission-mode", "auto"]
+# model_flag_template = "--model {model}"
+# model = "sonnet"
+# effort_flag_template = "--effort {effort}"
+# effort = "high"
+#
+# [agents.claude.modes.yolo]
+# args = ["--dangerously-skip-permissions"]
+
+# --- Example: override "codex" — never prompt for approval, high reasoning ---
+# -a/--ask-for-approval: untrusted | on-request | never
+#
+# The effort template keeps its inner quotes: codex parses -c values as TOML,
+# so model_reasoning_effort="high" must reach it quoted. Templates are split
+# on whitespace rather than shell-lexed precisely so that survives.
+#
+# [agents.codex]
+# command = "codex"
+# cwd = ".."
+# color = "#10a37f"
+# label = "Codex"
+# args = ["-a", "never"]
+# model_flag_template = "--model {model}"
+# model = "gpt-5-codex"
+# effort_flag_template = '-c model_reasoning_effort="{effort}"'
+# effort = "high"
+#
+# [agents.codex.modes.bypass]
+# args = ["--dangerously-bypass-approvals-and-sandbox"]
+
+# --- Example: override "agy" — always auto-approve, pin model ---
+# [agents.agy]
+# command = "agy"
+# cwd = ".."
+# color = "#00bcd4"
+# label = "Antigravity"
+# mcp_inject = "settings_file"
+# mcp_settings_path = "~/.gemini/config/mcp_config.json"
+# mcp_settings_style = "plain"
+# mcp_http_key = "serverUrl"
+# mcp_transport = "http"
+# args = ["--dangerously-skip-permissions"]
+# model_flag_template = "--model {model}"
+# model = "gemini-3.6-flash-medium"

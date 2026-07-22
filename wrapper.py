@@ -206,6 +206,20 @@ def _get_server_url(mcp_cfg: dict, transport: str) -> str:
     return f"http://127.0.0.1:{port}/mcp"
 
 
+def _expanduser_in(raw_path: str, env: dict[str, str] | None) -> Path:
+    """Like Path.expanduser(), but resolving `~` against `env`'s HOME.
+
+    Path.expanduser() reads the wrapper's own HOME. An agent config can give
+    the agent a different one (`env = { HOME = ... }`, to run a second profile
+    of the same CLI), and paths written for that agent have to follow it.
+    Falls back to normal expansion when the env sets no HOME.
+    """
+    home = (env or {}).get("HOME") or (env or {}).get("USERPROFILE")
+    if home and (raw_path == "~" or raw_path.startswith(("~/", "~\\"))):
+        return Path(home) / raw_path[2:] if len(raw_path) > 1 else Path(home)
+    return Path(raw_path).expanduser()
+
+
 def _apply_mcp_inject(
     inject_cfg: dict,
     instance_name: str,
@@ -215,11 +229,18 @@ def _apply_mcp_inject(
     token: str = "",
     mcp_cfg: dict | None = None,
     project_dir: Path | None = None,
+    agent_env: dict[str, str] | None = None,
 ) -> tuple[list[str], dict[str, str], Path | None]:
     """Apply MCP config injection based on the resolved inject config.
 
     Returns (extra_launch_args, inject_env, settings_path_or_None).
     settings_path is stored so re-registration can rewrite it.
+
+    `agent_env` is the environment the agent will actually run under, which is
+    what `~` in mcp_settings_path must expand against — an agent given its own
+    HOME (a second profile of the same CLI) reads its settings from that HOME,
+    so expanding against the wrapper's would write the file where the agent
+    never looks.
     """
     mode = inject_cfg.get("mcp_inject")
     if not mode:
@@ -243,7 +264,7 @@ def _apply_mcp_inject(
             raise ValueError(f"mcp_inject = 'settings_file' requires mcp_settings_path")
         # Expand ~ to user home (e.g. ~/.codebuddy/.mcp.json), then resolve
         # relative paths against project_dir/CWD as before.
-        target = Path(raw_path).expanduser()
+        target = _expanduser_in(raw_path, agent_env)
         if not target.is_absolute():
             base = Path(project_dir) if project_dir else Path.cwd()
             target = base / target
@@ -379,9 +400,12 @@ def _build_provider_launch(
     On Windows they are simply merged into the Popen env dict.
     """
     inject_cfg = _resolve_mcp_inject(agent, agent_cfg)
+    # `env` already carries the agent's config `env` overrides, so MCP settings
+    # paths expand against the HOME the agent will actually run under.
     mcp_args, inject_env, settings_path = _apply_mcp_inject(
         inject_cfg, instance_name, data_dir, proxy_url,
         token=token, mcp_cfg=mcp_cfg, project_dir=project_dir,
+        agent_env=env,
     )
 
     launch_args = [*mcp_args, *extra_args]
@@ -409,6 +433,34 @@ def _auth_headers(token: str, *, include_json: bool = False) -> dict[str, str]:
     if include_json:
         headers["Content-Type"] = "application/json"
     return headers
+
+
+def _unix_attach_hint() -> str:
+    """How to reach this agent's terminal, for login/quota chat notices.
+
+    The agent shares the wrapper's terminal, so the thing to attach to is
+    whatever session the wrapper is running in — normally one the agentchattr
+    CLI created, in which case `agentchattr attach <name>` is the hint worth
+    printing. Falls back to plain tmux, then to no session at all.
+    """
+    import subprocess
+
+    if not os.environ.get("TMUX"):
+        return "check the terminal running the wrapper"
+    try:
+        result = subprocess.run(
+            ["tmux", "display-message", "-p", "#S"],
+            capture_output=True, text=True, timeout=2,
+        )
+        session = result.stdout.strip() if result.returncode == 0 else ""
+    except Exception:
+        session = ""
+    if not session:
+        return "check the terminal running the wrapper"
+    prefix = os.environ.get("AGENTCHATTR_SESSION_PREFIX") or ""
+    if prefix and session.startswith(prefix + "-"):
+        return f"agentchattr attach {session[len(prefix) + 1:]}"
+    return f"tmux attach -t {session}"
 
 
 # ---------------------------------------------------------------------------
@@ -588,13 +640,24 @@ def main():
     import urllib.error
     import urllib.request
 
-    from config_loader import apply_cli_overrides, load_config
+    from config_loader import (
+        apply_cli_overrides, load_config, resolve_launch_args, resolve_project_dir,
+    )
 
     # Apply AGENTCHATTR_* overrides (from CLI flags or env) BEFORE loading
     # config so the wrapper connects to the same data_dir/ports as a server
     # launched with matching flags.
     apply_cli_overrides()
-    config = load_config(ROOT)
+
+    # Resolve the project dir early (from AGENTCHATTR_CWD, set by --cwd or
+    # the agentchattr CLI) so a project-local agentchattr.toml — extra agents
+    # like a second Antigravity instance "agy2" — can be merged in before the
+    # agent's config is looked up. Shared with run.py so the server seeds its
+    # registry from the same roster this wrapper launches from. None when run
+    # without --cwd (classic single-instance launchers); the per-agent `cwd`
+    # fallback below still applies to the agent's working directory then.
+    project_dir_override = resolve_project_dir()
+    config = load_config(ROOT, project_dir=project_dir_override)
 
     # Per-project instances use a unique mcpServers key so shared per-user
     # settings files (agy/copilot/codebuddy) hold one entry per instance.
@@ -620,20 +683,32 @@ def main():
     parser.add_argument("--mcp-server-name", default=None, help="mcpServers key for injected MCP settings (default: agentchattr)")
     parser.add_argument("--no-attach", action="store_true",
                         help="Headless mode: don't attach to the agent's tmux session (for daemonized wrappers)")
+    # Launch shaping: named mode from config.toml plus per-run model/effort.
+    parser.add_argument("--mode",   default=None, help="Named mode from [agents.<agent>.modes] in config.toml")
+    parser.add_argument("--model",  default=None, help="Model to run the agent with (overrides config)")
+    parser.add_argument("--effort", default=None, help="Reasoning effort (overrides config)")
     args, extra = parser.parse_known_args()
 
     agent = args.agent
     agent_cfg = config.get("agents", {}).get(agent, {})
+
+    # Config-driven args go before argv passthrough so an explicit flag on the
+    # command line is the last one the agent sees.
+    try:
+        config_args, launch_warnings = resolve_launch_args(
+            agent, agent_cfg, mode=args.mode, model=args.model, effort=args.effort,
+        )
+    except ValueError as exc:
+        print(f"  Error: {exc}")
+        sys.exit(1)
+    for warning in launch_warnings:
+        print(f"  Warning: {warning}")
+    extra = [*config_args, *extra]
     # Project dir: AGENTCHATTR_CWD (set by --cwd or the agentchattr CLI)
     # overrides the per-agent config.toml `cwd`. Override paths resolve
     # against the invoking shell's cwd; config.toml paths resolve against
     # the install dir (ROOT), as before.
-    cwd_override = os.environ.get("AGENTCHATTR_CWD", "")
-    if cwd_override:
-        _p = Path(cwd_override).expanduser()
-        project_dir = (_p if _p.is_absolute() else Path.cwd() / _p).resolve()
-    else:
-        project_dir = (ROOT / agent_cfg.get("cwd", ".")).resolve()
+    project_dir = project_dir_override or (ROOT / agent_cfg.get("cwd", ".")).resolve()
     command = agent_cfg.get("command", agent)
     data_dir = ROOT / config.get("server", {}).get("data_dir", "./data")
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -749,11 +824,27 @@ def main():
 
     strip_vars = {"CLAUDECODE"} | set(agent_cfg.get("strip_env", []))
     env = {k: v for k, v in os.environ.items() if k not in strip_vars}
+    # Config `env` table: per-agent environment, applied before PATH lookup and
+    # before MCP settings paths expand. The main use is HOME, which runs a
+    # second profile of a CLI that keeps its auth under HOME — the agent is
+    # exec'd directly, with no shell, so a `VAR=val cmd` prefix in `command`
+    # would be read as part of the executable's name instead.
+    agent_env_cfg = agent_cfg.get("env", {})
+    if not isinstance(agent_env_cfg, dict):
+        print(f"  Error: [agents.{agent}] env must be a table of NAME = \"value\" pairs.")
+        sys.exit(1)
+    env.update({str(k): str(v) for k, v in agent_env_cfg.items()})
 
-    resolved = shutil.which(command)
+    resolved = shutil.which(command, path=env.get("PATH"))
     if not resolved:
         print(f"  Error: '{command}' not found on PATH.")
-        print("  Install it first, then try again.")
+        if " " in command or "=" in command:
+            print("  `command` is exec'd directly, not through a shell — it must name")
+            print("  one executable. For environment overrides use the `env` table:")
+            print(f'    [agents.{agent}.env]')
+            print('    HOME = "/path/to/profile"')
+        else:
+            print("  Install it first, then try again.")
         sys.exit(1)
     command = resolved
 
@@ -912,13 +1003,20 @@ def main():
         _screen_reader = get_screen_reader()
         _attach_hint = "check the agent's terminal window"
     else:
-        from wrapper_unix import get_activity_checker, get_screen_reader, run_agent
+        from wrapper_unix import (
+            AgentTerminal,
+            get_activity_checker,
+            get_screen_reader,
+            run_agent,
+        )
 
-        session_prefix = os.environ.get("AGENTCHATTR_SESSION_PREFIX") or "agentchattr"
-        unix_session_name = f"{session_prefix}-{assigned_name}"
-        _set_activity_checker(get_activity_checker(unix_session_name, trigger_flag=_trigger_flag))
-        _screen_reader = get_screen_reader(unix_session_name)
-        _attach_hint = f"tmux attach -t {unix_session_name}"
+        # The agent runs on a PTY this process owns, so the terminal handle —
+        # not a multiplexer session name — is what the watchers poll. It's
+        # built here because both are wired up before the agent starts.
+        _agent_terminal = AgentTerminal()
+        _set_activity_checker(get_activity_checker(_agent_terminal, trigger_flag=_trigger_flag))
+        _screen_reader = get_screen_reader(_agent_terminal)
+        _attach_hint = _unix_attach_hint()
 
     # Screen watchers: poll the agent's visible terminal for states the agent
     # can't report itself — auth/login prompts and quota exhaustion. Both
@@ -1024,7 +1122,7 @@ def main():
     if sys.platform == "win32":
         run_kwargs["enter_backend"] = agent_cfg.get("enter_backend", "console_input")
     if sys.platform != "win32":
-        run_kwargs["session_name"] = unix_session_name
+        run_kwargs["terminal"] = _agent_terminal
         run_kwargs["attach"] = not args.no_attach
 
     try:

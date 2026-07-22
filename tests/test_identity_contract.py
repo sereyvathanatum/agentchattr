@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -275,44 +276,210 @@ class WrapperLaunchTests(unittest.TestCase):
         self.assertIn("PATH", env)
 
 
+@unittest.skipIf(sys.platform == "win32", "PTY agent host is Mac/Linux only")
+class AgentTerminalTests(unittest.TestCase):
+    """The pyte-backed screen the login/quota watchers poll."""
+
+    def test_screen_is_none_until_the_agent_starts(self):
+        terminal = wrapper_unix.AgentTerminal(cols=40, rows=4)
+        # Detectors must not run against a blank screen before launch —
+        # "no screen" and "an empty screen" mean different things to them.
+        self.assertIsNone(terminal.read_screen())
+
+    def test_screen_renders_escape_sequences_away(self):
+        terminal = wrapper_unix.AgentTerminal(cols=40, rows=4)
+        read_fd, write_fd = os.pipe()
+        self.addCleanup(os.close, read_fd)
+        terminal.attach_pty(write_fd)
+        self.addCleanup(os.close, write_fd)
+
+        terminal.feed(b"Please \x1b[31mlog in\x1b[0m to continue\r\nsecond line")
+
+        screen = terminal.read_screen()
+        self.assertIn("Please log in to continue", screen)
+        self.assertIn("second line", screen)
+        self.assertNotIn("\x1b", screen)
+
+    def test_screen_reflects_only_what_is_currently_displayed(self):
+        # The whole reason for emulating a terminal rather than buffering the
+        # output stream: a cleared prompt has to actually leave the screen, or
+        # the watchers never report "resolved".
+        terminal = wrapper_unix.AgentTerminal(cols=40, rows=4)
+        read_fd, write_fd = os.pipe()
+        self.addCleanup(os.close, read_fd)
+        terminal.attach_pty(write_fd)
+        self.addCleanup(os.close, write_fd)
+
+        terminal.feed(b"session has expired")
+        self.assertIn("session has expired", terminal.read_screen())
+
+        terminal.feed(b"\x1b[2J\x1b[H")  # clear screen, home cursor
+        self.assertNotIn("session has expired", terminal.read_screen())
+
+    def test_inject_types_the_text_then_presses_enter(self):
+        terminal = wrapper_unix.AgentTerminal(cols=40, rows=4)
+        read_fd, write_fd = os.pipe()
+        self.addCleanup(os.close, read_fd)
+        terminal.attach_pty(write_fd)
+        self.addCleanup(os.close, write_fd)
+
+        terminal.inject("hello agent", delay=0)
+        self.assertEqual(os.read(read_fd, 1024), b"hello agent\r")
+
+        # Enter must be its own write: agent CLIs consume the prompt as it
+        # arrives, and a newline in the same write can submit early.
+        writes = []
+        with mock.patch.object(terminal, "write", side_effect=lambda d: writes.append(d) or True):
+            terminal.inject("second prompt", delay=0)
+        self.assertEqual(writes, [b"second prompt", b"\r"])
+
+    def test_activity_checker_reports_screen_changes_and_triggers(self):
+        terminal = wrapper_unix.AgentTerminal(cols=40, rows=4)
+        read_fd, write_fd = os.pipe()
+        self.addCleanup(os.close, read_fd)
+        terminal.attach_pty(write_fd)
+        self.addCleanup(os.close, write_fd)
+
+        trigger = [False]
+        check = wrapper_unix.get_activity_checker(terminal, trigger_flag=trigger)
+
+        self.assertFalse(check())  # first poll only seeds the baseline
+        terminal.feed(b"thinking...")
+        self.assertTrue(check())
+        self.assertFalse(check())  # unchanged screen is not activity
+
+        trigger[0] = True
+        self.assertTrue(check())
+        self.assertFalse(trigger[0])
+
+
+@unittest.skipIf(sys.platform == "win32", "PTY agent host is Mac/Linux only")
 class WrapperUnixLifecycleTests(unittest.TestCase):
-    def test_detach_keeps_wrapper_alive_until_tmux_session_ends(self):
-        commands = []
-        sleep_calls = []
-        has_session_states = iter([0, 0, 1])
+    """run_agent hosts the agent CLI directly on a PTY it owns."""
 
-        def fake_run(args, **kwargs):
-            commands.append(args)
-            if args[:2] == ["tmux", "has-session"]:
-                return SimpleNamespace(returncode=next(has_session_states))
-            return SimpleNamespace(returncode=0, stdout=b"")
+    def _script(self, body: str) -> str:
+        tmpdir = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(tmpdir, ignore_errors=True))
+        path = Path(tmpdir) / "fake_agent.sh"
+        path.write_text("#!/bin/bash\n" + body, "utf-8")
+        path.chmod(0o755)
+        return str(path)
 
-        with (
-            mock.patch.object(wrapper_unix, "_check_tmux"),
-            mock.patch.object(wrapper_unix.subprocess, "run", side_effect=fake_run),
-            mock.patch.object(
-                wrapper_unix.time,
-                "sleep",
-                side_effect=lambda seconds: sleep_calls.append(seconds),
-            ),
-        ):
+    def test_agent_receives_argv_and_env_without_a_shell_round_trip(self):
+        out = Path(tempfile.mkdtemp()) / "argv.txt"
+        self.addCleanup(lambda: __import__("shutil").rmtree(out.parent, ignore_errors=True))
+        command = self._script(
+            f'for a in "$@"; do printf "[%s]\\n" "$a" >> {out}; done\n'
+            f'printf "STRIPPED=[%s]\\n" "$STRIPPED" >> {out}\n'
+            f'printf "INJECTED=[%s]\\n" "$INJECTED" >> {out}\n'
+            f'printf "CWD=[%s]\\n" "$PWD" >> {out}\n'
+        )
+        cwd = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(cwd, ignore_errors=True))
+
+        wrapper_unix.run_agent(
+            command=command,
+            # codex's effort flag is the argument most likely to be mangled by
+            # a quoting round-trip: the inner quotes have to survive verbatim.
+            extra_args=["--model", "opus", "-c", 'model_reasoning_effort="high"'],
+            cwd=cwd,
+            env={"PATH": os.environ["PATH"], "STRIPPED": "should-be-gone"},
+            queue_file=Path("queue.jsonl"),
+            agent="claude",
+            no_restart=True,
+            start_watcher=lambda inject_fn: None,
+            strip_env=["STRIPPED"],
+            inject_env={"INJECTED": "value with spaces"},
+        )
+
+        written = out.read_text("utf-8")
+        self.assertIn("[--model]\n[opus]\n[-c]\n[model_reasoning_effort=\"high\"]", written)
+        self.assertIn("STRIPPED=[]", written)
+        self.assertIn("INJECTED=[value with spaces]", written)
+        self.assertIn(f"CWD=[{Path(cwd).resolve()}]", written)
+
+    def test_agent_output_lands_on_the_shared_screen(self):
+        terminal = wrapper_unix.AgentTerminal(cols=60, rows=6)
+        command = self._script('printf "agent is up\\n"\nsleep 0.3\n')
+        screens = []
+
+        def capture(inject_fn):
+            # start_watcher fires once the terminal is live, which is when the
+            # wrapper's watcher threads begin polling for real.
+            def poll():
+                for _ in range(40):
+                    time.sleep(0.05)
+                    screen = terminal.read_screen()
+                    if screen and "agent is up" in screen:
+                        screens.append(screen)
+                        return
+            threading.Thread(target=poll, daemon=True).start()
+
+        wrapper_unix.run_agent(
+            command=command, extra_args=[], cwd=".", env={"PATH": os.environ["PATH"]},
+            queue_file=Path("queue.jsonl"), agent="claude", no_restart=True,
+            start_watcher=capture, terminal=terminal,
+        )
+
+        self.assertTrue(screens, "agent output never reached the pyte screen")
+
+    def test_exited_agent_is_restarted_until_no_restart(self):
+        counter = Path(tempfile.mkdtemp()) / "runs"
+        self.addCleanup(
+            lambda: __import__("shutil").rmtree(counter.parent, ignore_errors=True))
+        command = self._script(f'printf "x" >> {counter}\n')
+
+        sleeps = []
+        real_sleep = time.sleep
+
+        def fake_sleep(seconds):
+            sleeps.append(seconds)
+            # Third launch is enough to prove the restart loop runs; break out
+            # rather than letting it spin for the real 3s backoff each time.
+            if counter.exists() and len(counter.read_text()) >= 3:
+                raise KeyboardInterrupt
+            real_sleep(min(seconds, 0.01))
+
+        with mock.patch.object(wrapper_unix.time, "sleep", side_effect=fake_sleep):
             wrapper_unix.run_agent(
-                command="claude",
-                extra_args=["--debug"],
-                cwd=".",
-                env={},
-                queue_file=Path("queue.jsonl"),
-                agent="claude",
-                no_restart=False,
+                command=command, extra_args=[], cwd=".", env={"PATH": os.environ["PATH"]},
+                queue_file=Path("queue.jsonl"), agent="claude", no_restart=False,
                 start_watcher=lambda inject_fn: None,
-                session_name="agentchattr-claude-1",
             )
 
-        has_session_checks = [
-            args for args in commands if args[:2] == ["tmux", "has-session"]
-        ]
-        self.assertEqual(len(has_session_checks), 3)
-        self.assertEqual(sleep_calls, [1])
+        self.assertGreaterEqual(len(counter.read_text()), 3)
+        self.assertIn(3, sleeps)  # the restart backoff
+
+    def test_pid_holder_tracks_the_agent_process(self):
+        seen = []
+        pid_holder = [None]
+        command = self._script("sleep 0.3\n")
+
+        def watch(inject_fn):
+            def poll():
+                for _ in range(40):
+                    time.sleep(0.05)
+                    if pid_holder[0] is not None:
+                        seen.append(pid_holder[0])
+                        return
+            threading.Thread(target=poll, daemon=True).start()
+
+        wrapper_unix.run_agent(
+            command=command, extra_args=[], cwd=".", env={"PATH": os.environ["PATH"]},
+            queue_file=Path("queue.jsonl"), agent="claude", no_restart=True,
+            start_watcher=watch, pid_holder=pid_holder,
+        )
+
+        self.assertTrue(seen, "pid_holder was never populated")
+        self.assertIsNone(pid_holder[0], "pid_holder should clear once the agent exits")
+
+    def test_missing_command_does_not_hang_the_wrapper(self):
+        wrapper_unix.run_agent(
+            command="/nonexistent/agent-binary", extra_args=[], cwd=".",
+            env={"PATH": os.environ["PATH"]}, queue_file=Path("queue.jsonl"),
+            agent="claude", no_restart=False,
+            start_watcher=lambda inject_fn: None,
+        )
 
 
 @unittest.skipUnless(sys.platform == "win32", "Windows-only wrapper compatibility test")

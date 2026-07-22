@@ -1,3 +1,6 @@
 fastapi>=0.110
 uvicorn[standard]>=0.29
 mcp>=1.0
+# Terminal emulator: renders the agent PTY's output into a screen the login
+# and quota watchers can poll (Mac/Linux; wrapper_unix.py).
+pyte>=0.8

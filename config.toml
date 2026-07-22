@@ -12,18 +12,31 @@ command = "claude"
 cwd = ".."
 color = "#da7756"
 label = "Claude"
+model_flag_template = "--model {model}"
+
+[agents.claude.modes.yolo]
+args = ["--dangerously-skip-permissions"]
 
 [agents.codex]
 command = "codex"
 cwd = ".."
 color = "#10a37f"
 label = "Codex"
+model_flag_template = "--model {model}"
+effort_flag_template = '-c model_reasoning_effort="{effort}"'
+
+[agents.codex.modes.bypass]
+args = ["--dangerously-bypass-approvals-and-sandbox"]
 
 [agents.gemini]
 command = "gemini"
 cwd = ".."
 color = "#4285f4"
 label = "Gemini"
+model_flag_template = "--model {model}"
+
+[agents.gemini.modes.yolo]
+args = ["--yolo"]
 
 [agents.kimi]
 command = "kimi"
@@ -40,6 +53,10 @@ mcp_inject = "settings_file"
 mcp_settings_path = ".qwen/settings.json"
 mcp_transport = "http"
 inject_delay = 1.0
+model_flag_template = "--model {model}"
+
+[agents.qwen.modes.yolo]
+args = ["--yolo"]
 
 [agents.kilo]
 command = "kilo"
@@ -79,6 +96,9 @@ mcp_settings_style = "plain"
 mcp_http_key = "serverUrl"
 mcp_transport = "http"
 
+[agents.agy.modes.yolo]
+args = ["--dangerously-skip-permissions"]
+
 [agents.minimax]
 type = "api"
 base_url = "https://api.minimax.io/v1"
@@ -100,6 +120,52 @@ sse_port = 8201
 [images]
 upload_dir = "./uploads"
 max_size_mb = 10
+
+# --- Launch args, modes, model & effort ---
+# Per-agent keys that shape the agent CLI's command line:
+#
+#   args = ["--flag", "value"]     — always passed to this agent
+#   model = "opus"                 — rendered through model_flag_template
+#   effort = "high"                — rendered through effort_flag_template
+#
+# Model and effort are values, not flags, because every CLI spells them
+# differently. Each agent declares how to render them:
+#
+#   model_flag_template  = "--model {model}"
+#   effort_flag_template = '-c model_reasoning_effort="{effort}"'
+#
+# Templates are split on whitespace (not shell-lexed) so quotes inside a
+# template reach the agent intact — codex needs "high" quoted to parse it as
+# TOML. An agent with no template for a key simply can't honour it, and the
+# wrapper warns rather than dropping it silently. Leave a template unset for
+# CLIs whose flag you don't know instead of guessing.
+#
+# Named modes are presets of the same keys:
+#
+#   [agents.codex.modes.deep]
+#   effort = "high"
+#   args = ["--dangerously-bypass-approvals-and-sandbox"]
+#
+# Run them with `agentchattr up codex:deep` or `wrapper.py codex --mode deep`.
+# Precedence, lowest to highest: agent keys, mode keys, then --model/--effort
+# on the command line. `args` accumulate (agent's first, then the mode's,
+# then anything after `--` on the wrapper's command line).
+
+# --- Per-agent environment ---
+# The agent is exec'd directly, with no shell, so `command` must name one
+# executable — a "VAR=val cmd" prefix is read as part of the program's name
+# and won't resolve. Set environment with an env table instead:
+#
+#   [agents.agy2.env]
+#   HOME = "/home/you/.agy-profiles/agy2"
+#
+# Overriding HOME is how you run a second profile of a CLI that keeps its
+# login under HOME, so two instances can be signed in to different accounts.
+# It applies before PATH lookup, and `~` in mcp_settings_path expands against
+# it — settings land where that agent will actually read them.
+#
+#   strip_env = ["VAR"]  — remove variables from the agent's environment
+#                          (CLAUDECODE is always stripped)
 
 # --- MCP injection modes ---
 # By default, claude/codex/gemini/kimi use built-in MCP config injection.

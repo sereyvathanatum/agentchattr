@@ -59,7 +59,7 @@ brew install tmux    # macOS
 
 Open a terminal in the `macos-linux` folder (right-click → "Open Terminal Here", or `cd` into it) and run a launcher — e.g. `sh start_claude.sh`, `sh start_codex.sh`, `sh start_gemini.sh`, etc.
 
-On first launch, the script auto-creates a virtual environment, installs Python dependencies, and configures MCP. Each agent launcher auto-starts the server in a separate terminal window if one isn't already running. The agent opens inside a **tmux** session. Detach with `Ctrl+B, D` — the agent keeps running in the background. Reattach with `tmux attach -t agentchattr-claude`. More tmux recipes (list sessions, diagnose, restart, terminate) in [TMUX-README.md](TMUX-README.md).
+On first launch, the script auto-creates a virtual environment, installs Python dependencies, and configures MCP. Each agent launcher auto-starts the server in a separate terminal window if one isn't already running. The agent runs in that terminal, hosted directly by the wrapper — closing it stops the agent. To be able to walk away, start the launcher inside tmux, or use `agentchattr up` (below), which does it for you. More tmux recipes (list sessions, diagnose, restart, terminate) in [TMUX-README.md](TMUX-README.md).
 
 <details>
 <summary>All agent launchers (click to expand)</summary>
@@ -164,7 +164,7 @@ Agents include choices via `chat_send(message="Should I merge?", choices=["Yes",
 Decision cards use the sender's agent color for button borders and tinting. Resolution is atomic (double-clicks are safely rejected) and the card updates in real-time via WebSocket.
 
 ### Activity indicators
-Status pills show a spinning border in each agent's color when that agent is actively working — so you can minimize the terminals and still know at a glance who's busy. Detection works by hashing the agent's terminal screen buffer every second: if anything changes (spinner, streaming text, tool output), the pill lights up. When the screen stops changing, it stops instantly. Cross-platform — Windows uses `ReadConsoleOutputW`, Mac/Linux uses `tmux capture-pane`.
+Status pills show a spinning border in each agent's color when that agent is actively working — so you can minimize the terminals and still know at a glance who's busy. Detection works by hashing the agent's terminal screen buffer every second: if anything changes (spinner, streaming text, tool output), the pill lights up. When the screen stops changing, it stops instantly. Cross-platform — Windows uses `ReadConsoleOutputW`, Mac/Linux renders the agent's terminal output through an embedded terminal emulator.
 
 ### Multi-instance agents
 Run multiple instances of the same provider — double-click the launcher again and a second instance auto-registers with its own identity, color, status pill, and @mention routing. No configuration needed.
@@ -190,7 +190,7 @@ Unread indicators keep you oriented across the UI — channel tabs show unread c
 
 A small update pill appears in the channel bar when a newer release is available on GitHub. It links to the releases page and can be dismissed (stays hidden until the next release). Forks see "Upstream update available" instead. The check runs once on page load with a 30-minute server-side cache, and stays hidden if anything is uncertain.
 
-**Login alerts** — if an agent's CLI stops on a login/authentication screen (expired session, first launch, revoked token), the wrapper detects it and posts a system message in chat telling you which agent is stuck and how to reach its terminal (e.g. `tmux attach -t agentchattr-claude`). An all-clear message follows once the login completes. Disable per agent with `login_watch = false`, or add custom prompt patterns with `login_patterns = [...]` in `config.toml`.
+**Login alerts** — if an agent's CLI stops on a login/authentication screen (expired session, first launch, revoked token), the wrapper detects it and posts a system message in chat telling you which agent is stuck and how to reach its terminal (e.g. `agentchattr attach w1-claude`). An all-clear message follows once the login completes. Disable per agent with `login_watch = false`, or add custom prompt patterns with `login_patterns = [...]` in `config.toml`.
 
 **Quota alerts** — an agent that runs out of provider quota normally dies silently: it can't even send a goodbye, because the MCP call that would announce it is itself blocked by the limit it just hit. The wrapper closes that gap out-of-band — it watches the agent's terminal for usage-limit / out-of-credit / rate-limit screens (detection costs zero quota) and the server announces the outage in chat on the agent's behalf, so both humans and other agents know not to wait on it. The reset time is tracked too: when the CLI prints one ("resets 3am", "resets Jul 24", "try again in 4 hours") it's parsed and included in the announcement, anyone who @mentions the exhausted agent gets a one-time heads-up with the ETA, and when the reset time passes the server posts that the agent should be back. For CLIs that don't print a reset time, set `quota_reset_hours = N` as a fallback estimate (e.g. `5` for Claude's rolling 5-hour window). Disable with `quota_watch = false` or extend detection with `quota_patterns = [...]` in `config.toml`. Tip: running `/usage` in Claude Code's terminal shows exact session and weekly reset times.
 
@@ -490,7 +490,7 @@ python wrapper.py claude \
 - `AGENTCHATTR_MCP_SSE_PORT` — overrides `mcp.sse_port`
 - `AGENTCHATTR_UPLOAD_DIR` — overrides `images.upload_dir`
 - `AGENTCHATTR_CWD` — overrides every agent's `cwd` (`--cwd`, wrapper only)
-- `AGENTCHATTR_SESSION_PREFIX` — tmux session name prefix (`--session-prefix`, wrapper only)
+- `AGENTCHATTR_SESSION_PREFIX` — tmux session name prefix used by the `agentchattr` CLI (`--session-prefix`, wrapper only)
 - `AGENTCHATTR_MCP_SERVER_NAME` — `mcpServers` key for injected MCP settings (`--mcp-server-name`, wrapper only)
 
 Relative paths resolve against the shell's current directory (not agentchattr's install location), so `./.agentchattr` ends up inside your project folder.
@@ -521,6 +521,27 @@ agentchattr down                      # stop this project's swarm (--purge delet
 Every `up` gives the project a fully isolated instance: its own server + MCP ports (allocated deterministically from the project path, starting at 8310 so the classic launchers on 8300 coexist), its own data/uploads/logs under `~/.agentchattr/instances/<slug>/`, and its own tmux session prefix and MCP settings key so concurrent swarms in different projects never collide — even agents like Antigravity that share a per-user settings file. Repeat an agent name (`agy agy`) for multiple instances of the same CLI.
 
 Everything runs detached in tmux sessions: closing the terminal you ran `up` from stops nothing. `up` is idempotent — re-running it only starts what's missing (and restarts the server if it died). API-type agents (e.g. minimax) aren't supported by `up` yet; run `python wrapper_api.py <name>` with matching flags instead.
+
+#### Project-defined agents (agentchattr.toml)
+
+Drop an `agentchattr.toml` file in the project directory you run `up` from to define extra agents scoped to that project — e.g. a second Antigravity instance with its own default mode, without touching the shared install's `config.toml`:
+
+```toml
+# ~/projects/myapp/agentchattr.toml
+[agents.agy2]
+command = "agy"
+cwd = ".."
+color = "#00838f"
+label = "Antigravity 2"
+mcp_inject = "settings_file"
+mcp_settings_path = "~/.gemini/config/mcp_config.json"
+mcp_settings_style = "plain"
+mcp_http_key = "serverUrl"
+mcp_transport = "http"
+args = ["--dangerously-skip-permissions"]
+```
+
+It uses the same schema as `[agents.*]` in `config.toml` (see the "Launch args, modes, model & effort" comments there for `args`/`modes`/`model_flag_template`). Precedence is `config.toml` > `config.local.toml` > `agentchattr.toml`: a project file can only add new agent names (like `agy2`, `agy3`) — it can't override `claude`, `codex`, `agy`, or anything else already defined upstream. Run it with `agentchattr up agy2` alongside (or instead of) `agy`.
 
 ### API agents (local models)
 
@@ -597,7 +618,7 @@ Available models: `MiniMax-M3` (default), `MiniMax-M2.7`, `MiniMax-M2.7-highspee
        │  stdin injection           │  └──────────┘ │
 ┌──────┴───────┐  POST /api/register│  ┌──────────┐ │
 │  wrapper.py  │───────────────────►│  │  Router   │ │
-│  Win32 /tmux │  watches queue     │  │ (@mention)│ │
+│  Win32 / PTY │  watches queue     │  │ (@mention)│ │
 └──────────────┘  files for triggers│  └──────────┘ │
                                     └──────────────┘
 ```
@@ -623,7 +644,7 @@ Available models: `MiniMax-M3` (default), `MiniMax-M2.7`, `MiniMax-M2.7-highspee
 | `mcp_proxy.py` | Per-instance MCP proxy — injects sender identity into all tool calls |
 | `wrapper.py` | Cross-platform dispatcher — registration, auto-trigger, heartbeat, activity monitor |
 | `wrapper_windows.py` | Windows: keystroke injection + screen buffer activity detection |
-| `wrapper_unix.py` | Mac/Linux: tmux keystroke injection + pane capture activity detection |
+| `wrapper_unix.py` | Mac/Linux: runs the agent on a PTY, injects prompts into it, renders its screen for activity/login/quota detection |
 | `config.toml` | All configuration (agents, ports, routing) |
 | `windows/start_*_yolo/bypass.bat` | Auto-approve launchers (Windows) |
 | `macos-linux/start_*_yolo/bypass.sh` | Auto-approve launchers (Mac/Linux) |
@@ -633,7 +654,7 @@ Available models: `MiniMax-M3` (default), `MiniMax-M2.7`, `MiniMax-M2.7-highspee
 - **Python 3.11+** (uses `tomllib`)
 - At least one CLI agent installed (Claude Code, Codex, etc.)
 - **Windows**: no extra dependencies
-- **Mac/Linux**: `tmux` (for auto-trigger — `brew install tmux` or `apt install tmux`)
+- **Mac/Linux**: `tmux` (for `agentchattr up` — `brew install tmux` or `apt install tmux`)
 
 Python package dependencies (`fastapi`, `uvicorn`, `mcp`) are listed in `requirements.txt`. The quickstart scripts automatically create a virtual environment and install these on first launch — no manual `pip install` needed.
 
@@ -642,7 +663,7 @@ Python package dependencies (`fastapi`, `uvicorn`, `mcp`) are listed in `require
 Auto-trigger works on all platforms:
 
 - **Windows** — `wrapper_windows.py` injects keystrokes into the agent's console via Win32 `WriteConsoleInput`. The agent runs as a direct subprocess.
-- **Mac/Linux** — `wrapper_unix.py` runs the agent inside a `tmux` session and injects keystrokes via `tmux send-keys`. Detach with `Ctrl+B, D` to leave the agent running in the background; reattach with `tmux attach -t agentchattr-claude`. See **[TMUX-README.md](TMUX-README.md)** for the full guide: listing sessions, diagnosing stuck agents, completing login prompts, restarting, and shutting agents down.
+- **Mac/Linux** — `wrapper_unix.py` runs the agent CLI as its own child process on a pseudo-terminal, relays it to whatever terminal the wrapper is in, and injects prompts by writing to it. `agentchattr up` puts each wrapper in a tmux session, so `agentchattr attach w1-claude` reaches the agent and `Ctrl+B, D` leaves it running. See **[TMUX-README.md](TMUX-README.md)** for the full guide: listing sessions, diagnosing stuck agents, completing login prompts, restarting, and shutting agents down.
 
 The chat server and web UI are fully cross-platform (Python + browser).
 

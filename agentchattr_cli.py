@@ -230,7 +230,12 @@ class Instance:
         return sorted(out)
 
     def agent_tui_sessions(self) -> list[str]:
-        """Agent CLI sessions (everything that's not server or a controller)."""
+        """Stray agent CLI sessions (everything that's not server or a controller).
+
+        Wrappers used to start a separate session for the agent; they now run
+        it on their own PTY, so this is only ever non-empty for sessions left
+        behind by a wrapper from before that change.
+        """
         out = []
         for name in tmux_sessions(self.prefix):
             rest = name[len(self.prefix) + 1:]
@@ -243,9 +248,15 @@ class Instance:
         return f"{self.prefix}-server"
 
 
-def _load_agents_config() -> dict:
+def _load_agents_config(project_dir: Path | None = None) -> dict:
     from config_loader import load_config
-    return load_config(ROOT).get("agents", {})
+    return load_config(ROOT, project_dir=project_dir).get("agents", {})
+
+
+def parse_agent_spec(spec: str) -> tuple[str, str | None]:
+    """Split an `up` argument into (agent, mode). `codex:deep` -> ("codex", "deep")."""
+    base, sep, mode = spec.partition(":")
+    return base, (mode if sep and mode else None)
 
 
 def _server_ready(port: int, timeout: float) -> bool:
@@ -276,14 +287,15 @@ def _tail(path: Path, n: int = 20) -> str:
 def cmd_up(args) -> int:
     _check_tmux()
     inst = Instance.here()
-    agents_cfg = _load_agents_config()
+    agents_cfg = _load_agents_config(inst.project_dir)
 
-    bases = args.agents
-    if not bases:
-        print("Usage: agentchattr up <agent> [<agent> ...]   e.g. agentchattr up claude codex agy agy")
+    if not args.agents:
+        print("Usage: agentchattr up <agent>[:<mode>] ...   e.g. agentchattr up claude:yolo codex agy agy")
         print(f"Available agents: {', '.join(sorted(agents_cfg))}")
         return 1
-    for base in bases:
+
+    specs = [parse_agent_spec(s) for s in args.agents]
+    for base, mode in specs:
         cfg = agents_cfg.get(base)
         if cfg is None:
             print(f"Error: unknown agent '{base}'. Available: {', '.join(sorted(agents_cfg))}")
@@ -291,6 +303,10 @@ def cmd_up(args) -> int:
         if cfg.get("type") == "api":
             print(f"Error: '{base}' is an API agent — not supported by `up` yet.")
             print(f"Run it manually instead: python wrapper_api.py {base}")
+            return 1
+        if mode and mode not in cfg.get("modes", {}):
+            known = ", ".join(sorted(cfg.get("modes", {}))) or "none defined"
+            print(f"Error: unknown mode '{mode}' for agent '{base}' (available: {known})")
             return 1
 
     state = inst.state() or {
@@ -322,6 +338,10 @@ def cmd_up(args) -> int:
         "--mcp-sse-port", str(ports["mcp_sse"]),
         "--data-dir", str(inst.data_dir),
         "--upload-dir", str(inst.upload_dir),
+        # The server needs the project dir too, not just the wrappers: it reads
+        # the project's agentchattr.toml to seed its registry, and an agent
+        # missing from that roster rejects its wrapper's registration.
+        "--cwd", str(inst.project_dir),
     ]
 
     # --- Server ---
@@ -346,16 +366,19 @@ def cmd_up(args) -> int:
     running_counts: dict[str, int] = {}
     for _, base, _name in running:
         running_counts[base] = running_counts.get(base, 0) + 1
-    requested_counts: dict[str, int] = {}
-    for base in bases:
-        requested_counts[base] = requested_counts.get(base, 0) + 1
+    # Modes aren't part of a session name, so restarts are counted per base:
+    # `up claude claude:yolo` with one claude already running starts the yolo
+    # one, matching the specs in the order they were given.
+    requested: dict[str, list[str | None]] = {}
+    for base, mode in specs:
+        requested.setdefault(base, []).append(mode)
 
     used_ns = {n for n, _, _ in running}
     next_n = 1
     started = []
-    for base, want in requested_counts.items():
+    for base, modes_wanted in requested.items():
         have = running_counts.get(base, 0)
-        for _ in range(max(0, want - have)):
+        for mode in modes_wanted[have:]:
             while next_n in used_ns:
                 next_n += 1
             used_ns.add(next_n)
@@ -363,28 +386,33 @@ def cmd_up(args) -> int:
             cmd = [
                 py, str(ROOT / "wrapper.py"),
                 "--no-attach",
-                "--cwd", str(inst.project_dir),
                 *iso_flags,
                 "--session-prefix", inst.prefix,
                 "--mcp-server-name", inst.prefix,
-                base,
             ]
+            if mode:
+                cmd += ["--mode", mode]
+            if args.model:
+                cmd += ["--model", args.model]
+            if args.effort:
+                cmd += ["--effort", args.effort]
+            cmd.append(base)
             if not new_session(name, ROOT, cmd, logfile=inst.logs_dir / f"w{next_n}-{base}.log"):
                 return 1
-            started.append((next_n, base))
+            started.append((next_n, base, mode))
 
     state["agents"] = sorted({base for _, base, _ in inst.wrapper_sessions()}
-                             | {b for _, b in started}
+                             | {b for _, b, _ in started}
                              | set(state.get("agents", [])))
     state["last_up"] = datetime.now(timezone.utc).isoformat()
     save_state(inst.slug, state)
 
     if started:
         print(f"Started {len(started)} agent(s): " +
-              ", ".join(f"w{n}-{b}" for n, b in started))
+              ", ".join(f"w{n}-{b}" + (f" ({m})" if m else "") for n, b, m in started))
     else:
         print("All requested agents already running.")
-    already = sum(min(running_counts.get(b, 0), c) for b, c in requested_counts.items())
+    already = sum(min(running_counts.get(b, 0), len(m)) for b, m in requested.items())
     if already:
         print(f"({already} already running)")
     print()
@@ -448,20 +476,15 @@ def _print_instance_status(inst: Instance) -> None:
                   "'agentchattr down --purge' to remove)")
         return
 
-    tui_names = {t[len(inst.prefix) + 1:]: t for t in tuis}
-    claimed = set()
+    # One session per agent: the wrapper runs the agent CLI on its own PTY,
+    # so the controller session *is* where the agent's terminal lives.
     for n, base, _name in wrappers:
-        # Best-effort pairing of controller -> TUI session by base name.
-        tui = next((t for short, t in sorted(tui_names.items())
-                    if t not in claimed and (short == base or short.startswith(base + "-"))),
-                   None)
-        if tui:
-            claimed.add(tui)
-        tui_note = f"agent: {tui[len(inst.prefix) + 1:]}" if tui else "agent: (starting/exited)"
-        print(f"w{n}-{base:<9} controller up   {tui_note}   log: {inst.logs_dir / f'w{n}-{base}.log'}")
+        label = f"w{n}-{base}"
+        print(f"{label:<10} running    attach: agentchattr attach {label}"
+              f"   log: {inst.logs_dir / f'{label}.log'}")
     for t in tuis:
-        if t not in claimed:
-            print(f"{t[len(inst.prefix) + 1:]:<12} agent session (no controller — will not auto-restart)")
+        print(f"{t[len(inst.prefix) + 1:]:<10} stray agent session from an older version "
+              f"('agentchattr down' clears it)")
 
 
 def cmd_down(args) -> int:
@@ -473,7 +496,7 @@ def cmd_down(args) -> int:
     wrappers = inst.wrapper_sessions()
     for _, _, name in wrappers:
         kill_session(name)
-    # 2. Agent TUI sessions.
+    # 2. Stray agent sessions left by a pre-PTY wrapper.
     tuis = inst.agent_tui_sessions()
     for name in tuis:
         kill_session(name)
@@ -489,7 +512,7 @@ def cmd_down(args) -> int:
     # 4. Best-effort: remove this instance's entry from shared per-user MCP
     #    settings files (agy/copilot/codebuddy style settings_file injection).
     server_name = state.get("server_name", inst.prefix)
-    agents_cfg = _load_agents_config()
+    agents_cfg = _load_agents_config(inst.project_dir)
     cleaned = []
     for base in state.get("agents", []):
         cfg = agents_cfg.get(base, {})
@@ -593,7 +616,11 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_up = sub.add_parser("up", help="Start the server and the listed agents in this project dir")
-    p_up.add_argument("agents", nargs="*", help="Agent names from config.toml; repeat for multiple instances (e.g. agy agy)")
+    p_up.add_argument("agents", nargs="*",
+                      help="Agent names from config.toml, optionally <agent>:<mode>; "
+                           "repeat for multiple instances (e.g. agy agy claude:yolo)")
+    p_up.add_argument("--model",  default=None, help="Model for every agent started by this command")
+    p_up.add_argument("--effort", default=None, help="Reasoning effort for every agent started by this command")
     p_up.set_defaults(func=cmd_up)
 
     p_status = sub.add_parser("status", help="Show this project's swarm status")
