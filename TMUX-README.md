@@ -44,6 +44,8 @@ tmux session at all — see [Classic launchers](#classic-launchers) below.
 agentchattr status                          # list agents + attach commands
 agentchattr attach w1-claude                # connect to an agent's terminal
 # Ctrl+B, then D                            # detach (agent keeps running)
+agentchattr down codex agy2                 # stop selected configured agents
+agentchattr up codex agy2                   # restart them from current config
 agentchattr down                            # stop everything for this project
 
 tmux ls                                     # raw session list, all projects
@@ -182,6 +184,7 @@ down with it, because they now live in the same session.
 ## Stopping an agent for good
 
 ```bash
+agentchattr down codex    # selected agent only; server and others stay running
 agentchattr down          # this project: agents, wrappers, server
 agentchattr down --purge  # also delete the project's instance dir
 ```

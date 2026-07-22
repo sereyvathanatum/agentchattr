@@ -869,6 +869,14 @@ function getSenderClass(sender) {
 function resolveAgent(name) {
     const s = name.toLowerCase();
     if (s in agentConfig) return s;
+    // Agent-authored messages may use the visible label instead of the
+    // registry key (for example @antigravity-2 for canonical name `agy2`).
+    for (const [key, cfg] of Object.entries(agentConfig)) {
+        const labelMention = String(cfg.label || '')
+            .trim().toLowerCase().replace(/ /g, '-').replace(/[^a-z0-9-]/g, '')
+            .replace(/^-+|-+$/g, '');
+        if (labelMention && s === labelMention) return key;
+    }
     // Try prefix match: "gemini-cli" → "gemini"
     for (const key of Object.keys(agentConfig)) {
         if (s.startsWith(key)) return key;

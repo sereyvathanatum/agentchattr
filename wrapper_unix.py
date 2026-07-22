@@ -90,6 +90,10 @@ class AgentTerminal:
         self._lock = threading.Lock()
         self._master_fd: int | None = None
         self.pid: int | None = None
+        # Monotonic counter of PTY output chunks.  Polling only the rendered
+        # screen can miss a spinner/redraw that cycles back to the same frame
+        # between polls, which made active agents intermittently look idle.
+        self._output_generation = 0
 
     # -- lifecycle -------------------------------------------------------
 
@@ -113,6 +117,13 @@ class AgentTerminal:
     def feed(self, data: bytes) -> None:
         with self._lock:
             self._stream.feed(data)
+            if data:
+                self._output_generation += 1
+
+    def read_output_generation(self) -> int:
+        """Return a per-terminal counter that advances whenever the PTY writes."""
+        with self._lock:
+            return self._output_generation
 
     def read_screen(self) -> str | None:
         """Rendered visible screen, or None before the agent has started.
@@ -165,21 +176,40 @@ def get_screen_reader(terminal: AgentTerminal):
 
 
 def get_activity_checker(terminal: AgentTerminal, trigger_flag=None):
-    """Return a callable that detects agent output by hashing the screen."""
-    last_hash = [None]
+    """Return a callable that detects recent agent PTY output.
+
+    Activity is held through a few quiet polls so an agent does not flicker
+    idle between intermittent TUI frames.  Each checker owns its state, which
+    keeps multiple instances of the same CLI independent.
+    """
+    last_generation = [None]
+    consecutive_idle = [0]
+    active = [False]
+    idle_cooldown = 5
 
     def check():
         # External trigger: queue watcher injected a message
+        triggered = False
         if trigger_flag is not None and trigger_flag[0]:
             trigger_flag[0] = False
-            return True
-        screen = terminal.read_screen()
-        if screen is None:
-            return False
-        h = hash(screen)
-        changed = last_hash[0] is not None and h != last_hash[0]
-        last_hash[0] = h
-        return changed
+            triggered = True
+
+        generation = terminal.read_output_generation()
+        changed = (
+            last_generation[0] is not None
+            and generation != last_generation[0]
+        )
+        last_generation[0] = generation
+
+        if changed or triggered:
+            consecutive_idle[0] = 0
+            active[0] = True
+        else:
+            consecutive_idle[0] += 1
+            if consecutive_idle[0] >= idle_cooldown:
+                active[0] = False
+
+        return active[0]
 
     return check
 

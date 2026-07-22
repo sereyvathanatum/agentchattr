@@ -36,7 +36,7 @@
 # command = "agy"
 # cwd = ".."
 # color = "#00838f"
-# label = "Antigravity 2"
+# label = "Antigravity 2"  # registers with the @antigravity-2 handle
 # mcp_inject = "settings_file"
 # mcp_settings_path = "~/.gemini/config/mcp_config.json"
 # mcp_settings_style = "plain"

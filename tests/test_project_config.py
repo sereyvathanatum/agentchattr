@@ -176,7 +176,7 @@ class ServerSeedsProjectAgentsTests(unittest.TestCase):
         registry = self._seeded_registry(self.project)
         result = registry.register("agy2")
         self.assertIsNotNone(result, "project agent was rejected as an unknown base")
-        self.assertEqual(result["name"], "agy2")
+        self.assertEqual(result["name"], "antigravity-2")
 
     def test_project_agent_keeps_its_color_and_label(self):
         """Project-defined color/label reach the registry, not just launch args."""

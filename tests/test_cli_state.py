@@ -8,7 +8,9 @@ import socket
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -123,6 +125,120 @@ class SessionNameParsingTests(unittest.TestCase):
         # Agent TUI sessions (server-assigned names) must NOT match.
         self.assertIsNone(pattern.match(f"{inst.prefix}-agy-2"))
         self.assertIsNone(pattern.match(f"{inst.prefix}-server"))
+
+    def test_selective_down_resolves_base_and_exact_worker_names(self):
+        wrappers = [
+            (1, "codex", "prefix-w1-codex"),
+            (2, "agy", "prefix-w2-agy"),
+            (3, "agy", "prefix-w3-agy"),
+            (4, "agy2", "prefix-w4-agy2"),
+        ]
+
+        selected, missing = cli.select_wrapper_sessions(
+            wrappers, ["codex", "w3-agy", "agy2"]
+        )
+
+        self.assertEqual(
+            [session for _, _, session in selected],
+            ["prefix-w1-codex", "prefix-w3-agy", "prefix-w4-agy2"],
+        )
+        self.assertEqual(missing, [])
+
+    def test_selective_down_base_selects_all_running_instances(self):
+        wrappers = [
+            (2, "agy", "prefix-w2-agy"),
+            (3, "agy", "prefix-w3-agy"),
+            (4, "agy2", "prefix-w4-agy2"),
+        ]
+
+        selected, missing = cli.select_wrapper_sessions(wrappers, ["agy"])
+
+        self.assertEqual([n for n, _, _ in selected], [2, 3])
+        self.assertEqual(missing, [])
+
+    def test_selective_down_reports_unmatched_targets_without_duplicates(self):
+        wrappers = [(2, "agy", "prefix-w2-agy")]
+
+        selected, missing = cli.select_wrapper_sessions(
+            wrappers, ["agy", "w2-agy", "missing"]
+        )
+
+        self.assertEqual(selected, wrappers)
+        self.assertEqual(missing, ["missing"])
+
+    def test_selective_down_accepts_registry_label_handle(self):
+        wrappers = [(4, "agy2", "prefix-w4-agy2")]
+
+        selected, missing = cli.select_wrapper_sessions(
+            wrappers,
+            ["antigravity-2"],
+            aliases={"antigravity-2": "agy2"},
+        )
+
+        self.assertEqual(selected, wrappers)
+        self.assertEqual(missing, [])
+
+
+class SelectiveDownCommandTests(unittest.TestCase):
+    def test_stops_only_selected_wrapper_and_keeps_server_running(self):
+        inst = mock.Mock()
+        inst.project_dir = Path("/project")
+        inst.state.return_value = {"slug": "project-12345678"}
+        inst.wrapper_sessions.return_value = [
+            (1, "codex", "prefix-w1-codex"),
+            (2, "agy2", "prefix-w2-agy2"),
+        ]
+        args = SimpleNamespace(agents=["agy2"], purge=False)
+
+        with (
+            mock.patch.object(cli, "_check_tmux"),
+            mock.patch.object(cli.Instance, "here", return_value=inst),
+            mock.patch.object(cli, "_load_agents_config", return_value={
+                "codex": {"label": "chatgpt"},
+                "agy2": {"label": "antigravity 2"},
+            }),
+            mock.patch.object(cli, "kill_session") as kill,
+            mock.patch.object(cli, "save_state"),
+        ):
+            result = cli.cmd_down(args)
+
+        self.assertEqual(result, 0)
+        kill.assert_called_once_with("prefix-w2-agy2")
+        inst.server_session.assert_not_called()
+
+    def test_validates_every_target_before_stopping_anything(self):
+        inst = mock.Mock()
+        inst.project_dir = Path("/project")
+        inst.state.return_value = {}
+        inst.wrapper_sessions.return_value = [
+            (1, "codex", "prefix-w1-codex"),
+        ]
+        args = SimpleNamespace(agents=["codex", "missing"], purge=False)
+
+        with (
+            mock.patch.object(cli, "_check_tmux"),
+            mock.patch.object(cli.Instance, "here", return_value=inst),
+            mock.patch.object(cli, "_load_agents_config", return_value={
+                "codex": {"label": "chatgpt"},
+            }),
+            mock.patch.object(cli, "kill_session") as kill,
+        ):
+            result = cli.cmd_down(args)
+
+        self.assertEqual(result, 1)
+        kill.assert_not_called()
+
+
+class ServerReadinessTests(unittest.TestCase):
+    def test_cold_start_timeout_allows_slow_wsl_imports(self):
+        self.assertGreaterEqual(cli.SERVER_READY_TIMEOUT, 120)
+
+    def test_readiness_stops_immediately_when_server_session_exits(self):
+        with mock.patch.object(cli.urllib.request, "urlopen") as urlopen:
+            ready = cli._server_ready(65535, 120, alive_checker=lambda: False)
+
+        self.assertFalse(ready)
+        urlopen.assert_not_called()
 
 
 if __name__ == "__main__":

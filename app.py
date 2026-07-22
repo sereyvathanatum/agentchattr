@@ -21,7 +21,7 @@ from jobs import JobStore
 from schedules import ScheduleStore, parse_schedule_spec
 from router import Router
 from agents import AgentTrigger
-from registry import RuntimeRegistry
+from registry import RuntimeRegistry, normalize_agent_handle
 from session_store import SessionStore, validate_session_template
 from session_engine import SessionEngine
 
@@ -281,11 +281,17 @@ def configure(cfg: dict, session_token: str = ""):
     # Router starts with base agent names (backward compat for direct MCP users),
     # registry.on_change updates it dynamically when instances register/deregister
     agent_names = list(cfg.get("agents", {}).keys())
+    mention_aliases = {
+        alias: name
+        for name, agent_cfg in cfg.get("agents", {}).items()
+        if (alias := normalize_agent_handle(agent_cfg.get("label", "")))
+    }
     router = Router(
         agent_names=agent_names,
         default_mention=cfg.get("routing", {}).get("default", "none"),
         max_hops=max_hops,
         online_checker=lambda: set(registry.get_active_names()) if registry else set(),
+        mention_aliases=mention_aliases,
     )
     agents = AgentTrigger(registry, data_dir=data_dir)
 
@@ -1140,11 +1146,36 @@ def _on_registry_change():
     """Called from registry (any thread) when instances register/deregister/claim/rename."""
     # Update router with current agent names (base names + registered instances)
     if router and registry:
-        base_names = list(registry.get_bases().keys())
+        bases = registry.get_bases()
+        base_names = list(bases.keys())
         # Only include active instances in routing (pending ones are inert)
         instance_names = registry.get_active_names()
         all_names = list(set(base_names + instance_names))
-        router.update_agents(all_names)
+        aliases: dict[str, set[str]] = {}
+        for name, agent_cfg in bases.items():
+            alias = normalize_agent_handle(agent_cfg.get("label", ""))
+            if alias:
+                aliases.setdefault(alias, set()).add(name)
+
+        # A live instance label is more specific than its family label. Keep
+        # this alias for legacy registries created before labels became handles.
+        instance_aliases: dict[str, set[str]] = {}
+        for name, info in registry.get_all().items():
+            if info.get("state") != "active":
+                continue
+            alias = normalize_agent_handle(info.get("label", ""))
+            if alias:
+                instance_aliases.setdefault(alias, set()).add(name)
+        aliases.update(instance_aliases)
+
+        # Duplicate display labels are ambiguous. In that case require the
+        # canonical handle instead of unexpectedly waking several agents.
+        unambiguous_aliases = {
+            alias: next(iter(targets))
+            for alias, targets in aliases.items()
+            if len(targets) == 1
+        }
+        router.update_agents(all_names, mention_aliases=unambiguous_aliases)
     # Broadcast to WebSocket clients
     if _event_loop:
         asyncio.run_coroutine_threadsafe(broadcast_agents(), _event_loop)
@@ -1423,8 +1454,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 new_label = (event.get("label") or "").strip()
                 if agent_name and new_label and registry:
                     # Derive a sanitized sender ID from the label
-                    import re as _re
-                    new_id = _re.sub(r'[^a-z0-9-]', '', new_label.lower().replace(' ', '-')).strip('-')
+                    new_id = normalize_agent_handle(new_label)
                     if not new_id:
                         new_id = agent_name  # fallback: keep old name, just change label
                     if new_id == agent_name:
@@ -1460,8 +1490,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         # Accept default name
                         registry.confirm_pending(agent_name)
                     else:
-                        import re as _re
-                        new_id = _re.sub(r'[^a-z0-9-]', '', new_label.lower().replace(' ', '-')).strip('-')
+                        new_id = normalize_agent_handle(new_label)
                         if not new_id:
                             new_id = agent_name
                         if new_id == agent_name:
@@ -2231,11 +2260,14 @@ async def register_agent(request: Request):
         return JSONResponse({"error": "invalid JSON"}, status_code=400)
     base = body.get("base", "")
     label = body.get("label")
+    replace_reclaimable = bool(body.get("replace_reclaimable", False))
     if not base:
         return JSONResponse({"error": "base is required"}, status_code=400)
-    result = registry.register(base, label)
+    result = registry.register(base, label, replace_reclaimable=replace_reclaimable)
     if result is None:
         return JSONResponse({"error": f"unknown base: {base}"}, status_code=400)
+    if isinstance(result, str):
+        return JSONResponse({"error": result}, status_code=409)
     # Touch presence so the instance doesn't immediately time out
     import mcp_bridge
     with mcp_bridge._presence_lock:
@@ -2313,7 +2345,7 @@ async def rename_agent_label(name: str, request: Request):
         return JSONResponse({"error": "label is required"}, status_code=400)
 
     import re as _re
-    new_id = _re.sub(r'[^a-z0-9-]', '', label.lower().replace(' ', '-')).strip('-')
+    new_id = normalize_agent_handle(label)
     if not new_id:
         new_id = name
 

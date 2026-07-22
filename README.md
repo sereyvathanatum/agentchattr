@@ -164,7 +164,7 @@ Agents include choices via `chat_send(message="Should I merge?", choices=["Yes",
 Decision cards use the sender's agent color for button borders and tinting. Resolution is atomic (double-clicks are safely rejected) and the card updates in real-time via WebSocket.
 
 ### Activity indicators
-Status pills show a spinning border in each agent's color when that agent is actively working — so you can minimize the terminals and still know at a glance who's busy. Detection works by hashing the agent's terminal screen buffer every second: if anything changes (spinner, streaming text, tool output), the pill lights up. When the screen stops changing, it stops instantly. Cross-platform — Windows uses `ReadConsoleOutputW`, Mac/Linux renders the agent's terminal output through an embedded terminal emulator.
+Status pills show a spinning border in each agent's color when that agent is actively working — so you can minimize the terminals and still know at a glance who's busy. Mac/Linux detects each agent's PTY output independently, including redraws that return to the same spinner frame; a short quiet-period cooldown prevents flicker between updates. Windows uses `ReadConsoleOutputW` with the same cooldown behavior.
 
 ### Multi-instance agents
 Run multiple instances of the same provider — double-click the launcher again and a second instance auto-registers with its own identity, color, status pill, and @mention routing. No configuration needed.
@@ -410,7 +410,7 @@ host = "127.0.0.1"
 command = "claude"          # CLI command (must be on PATH)
 cwd = ".."                  # working directory for agent
 color = "#a78bfa"           # status pill + @mention color
-label = "Claude"            # display name
+label = "Claude"            # display name + default @handle (`@claude`)
 
 [agents.codex]
 command = "codex"
@@ -515,12 +515,14 @@ agentchattr status                    # what's running here (add --all for every
 agentchattr attach agy-2              # watch an agent live (Ctrl+B, D detaches)
 agentchattr logs w1-claude            # tail a wrapper's log
 agentchattr ui                        # open this project's chat UI
+agentchattr down codex agy2           # stop only these agents; keep server/others running
+agentchattr up codex agy2             # restart them using the latest project config
 agentchattr down                      # stop this project's swarm (--purge deletes its data)
 ```
 
 Every `up` gives the project a fully isolated instance: its own server + MCP ports (allocated deterministically from the project path, starting at 8310 so the classic launchers on 8300 coexist), its own data/uploads/logs under `~/.agentchattr/instances/<slug>/`, and its own tmux session prefix and MCP settings key so concurrent swarms in different projects never collide — even agents like Antigravity that share a per-user settings file. Repeat an agent name (`agy agy`) for multiple instances of the same CLI.
 
-Everything runs detached in tmux sessions: closing the terminal you ran `up` from stops nothing. `up` is idempotent — re-running it only starts what's missing (and restarts the server if it died). API-type agents (e.g. minimax) aren't supported by `up` yet; run `python wrapper_api.py <name>` with matching flags instead.
+Everything runs detached in tmux sessions: closing the terminal you ran `up` from stops nothing. `up` is idempotent — re-running it only starts what's missing (and restarts the server if it died). `down <agent> ...` stops selected configured agents while leaving the server and other agents running; use an exact status name such as `w2-agy` to stop only one of several instances. A later `up` reads the current config and recreates the missing agents. API-type agents (e.g. minimax) aren't supported by `up` yet; run `python wrapper_api.py <name>` with matching flags instead.
 
 #### Project-defined agents (agentchattr.toml)
 
@@ -541,7 +543,7 @@ mcp_transport = "http"
 args = ["--dangerously-skip-permissions"]
 ```
 
-It uses the same schema as `[agents.*]` in `config.toml` (see the "Launch args, modes, model & effort" comments there for `args`/`modes`/`model_flag_template`). Precedence is `config.toml` > `config.local.toml` > `agentchattr.toml`: a project file can only add new agent names (like `agy2`, `agy3`) — it can't override `claude`, `codex`, `agy`, or anything else already defined upstream. Run it with `agentchattr up agy2` alongside (or instead of) `agy`.
+It uses the same schema as `[agents.*]` in `config.toml` (see the "Launch args, modes, model & effort" comments there for `args`/`modes`/`model_flag_template`). Precedence is `config.toml` > `config.local.toml` > `agentchattr.toml`: a project file can only add new agent names (like `agy2`, `agy3`) — it can't override `claude`, `codex`, `agy`, or anything else already defined upstream. Run it with `agentchattr up agy2` alongside (or instead of) `agy`. The config key remains the launcher/provider name, while its `label` becomes the normalized registry and mention handle by default—for example `label = "Antigravity 2"` registers as `@antigravity-2`.
 
 ### API agents (local models)
 

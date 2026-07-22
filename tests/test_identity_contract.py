@@ -47,6 +47,77 @@ def auth_ctx(token: str) -> Context:
 
 
 class RuntimeRegistryTests(unittest.TestCase):
+    def test_configured_label_is_the_default_registry_handle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = RuntimeRegistry(data_dir=tmp)
+            registry.seed({
+                "agy2": {"label": "Antigravity 2", "color": "#060276"},
+            })
+
+            result = registry.register("agy2")
+
+            self.assertEqual(result["name"], "antigravity-2")
+            self.assertEqual(result["label"], "Antigravity 2")
+
+    def test_explicit_label_is_the_default_registry_handle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = RuntimeRegistry(data_dir=tmp)
+            registry.seed({"codex": {"label": "Codex", "color": "#10a37f"}})
+
+            result = registry.register("codex", label="chatgpt")
+
+            self.assertEqual(result["name"], "chatgpt")
+            self.assertEqual(result["label"], "chatgpt")
+
+    def test_label_handles_get_stable_multi_instance_suffixes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = RuntimeRegistry(data_dir=tmp)
+            registry.seed({
+                "worker": {"label": "Research Agent", "color": "#10a37f"},
+            })
+
+            first = registry.register("worker")
+            second = registry.register("worker")
+            third = registry.register("worker")
+
+            self.assertEqual(registry.resolve_token(first["token"])["name"], "research-agent-1")
+            self.assertEqual(second["name"], "research-agent-2")
+            self.assertEqual(third["name"], "research-agent-3")
+
+    def test_duplicate_label_handle_is_rejected_across_families(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = RuntimeRegistry(data_dir=tmp)
+            registry.seed({
+                "first": {"label": "Research Agent", "color": "#10a37f"},
+                "second": {"label": "Research Agent", "color": "#060276"},
+            })
+
+            registry.register("first")
+            duplicate = registry.register("second")
+
+            self.assertIsInstance(duplicate, str)
+            self.assertIn("already taken", duplicate)
+            self.assertEqual(registry.get_all_names(), ["research-agent"])
+
+    def test_cli_restart_replaces_reserved_slot_with_current_label(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = RuntimeRegistry(data_dir=tmp)
+            registry.seed({
+                "agy2": {"label": "Antigravity 2", "color": "#060276"},
+            })
+            first = registry.register("agy2")
+            registry.deregister(first["name"])
+
+            restarted = registry.register(
+                "agy2",
+                label="Hyundai Research",
+                replace_reclaimable=True,
+            )
+
+            self.assertEqual(restarted["name"], "hyundai-research")
+            self.assertEqual(restarted["slot"], 1)
+            self.assertNotEqual(restarted["token"], first["token"])
+
     def test_registers_active_instances_and_resolves_current_name_from_token(self):
         with tempfile.TemporaryDirectory() as tmp:
             registry = RuntimeRegistry(data_dir=tmp)
@@ -346,11 +417,50 @@ class AgentTerminalTests(unittest.TestCase):
         self.assertFalse(check())  # first poll only seeds the baseline
         terminal.feed(b"thinking...")
         self.assertTrue(check())
-        self.assertFalse(check())  # unchanged screen is not activity
+        # Brief gaps between TUI frames do not make the agent flicker idle.
+        for _ in range(4):
+            self.assertTrue(check())
+        self.assertFalse(check())
 
         trigger[0] = True
         self.assertTrue(check())
         self.assertFalse(trigger[0])
+
+    def test_activity_checker_detects_output_that_redraws_same_screen(self):
+        terminal = wrapper_unix.AgentTerminal(cols=40, rows=4)
+        read_fd, write_fd = os.pipe()
+        self.addCleanup(os.close, read_fd)
+        terminal.attach_pty(write_fd)
+        self.addCleanup(os.close, write_fd)
+
+        check = wrapper_unix.get_activity_checker(terminal)
+        terminal.feed(b".")
+        self.assertFalse(check())  # seed after the initial frame
+
+        # A spinner can redraw the same character before the one-second poll.
+        terminal.feed(b"\r.")
+        self.assertTrue(check())
+
+    def test_activity_checkers_keep_multiple_agent_instances_independent(self):
+        terminals = [wrapper_unix.AgentTerminal(cols=40, rows=4) for _ in range(2)]
+        fds = [os.pipe() for _ in terminals]
+        for terminal, (read_fd, write_fd) in zip(terminals, fds):
+            self.addCleanup(os.close, read_fd)
+            terminal.attach_pty(write_fd)
+            self.addCleanup(os.close, write_fd)
+
+        first = wrapper_unix.get_activity_checker(terminals[0])
+        second = wrapper_unix.get_activity_checker(terminals[1])
+        self.assertFalse(first())
+        self.assertFalse(second())
+
+        terminals[0].feed(b"agent one working")
+        self.assertTrue(first())
+        self.assertFalse(second())
+
+        terminals[1].feed(b"agent two working")
+        self.assertTrue(first())  # still inside its independent cooldown
+        self.assertTrue(second())
 
 
 @unittest.skipIf(sys.platform == "win32", "PTY agent host is Mac/Linux only")

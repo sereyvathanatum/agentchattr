@@ -9,7 +9,8 @@ project directory:
     agentchattr attach agy-2              # watch an agent (Ctrl+B, D detaches)
     agentchattr logs w1-claude            # tail a wrapper's log
     agentchattr ui                        # open this project's chat UI
-    agentchattr down                      # stop this project's swarm
+    agentchattr down codex agy2           # stop selected agents only
+    agentchattr down                      # stop this project's whole swarm
 
 Each project gets a fully isolated instance: its own server/MCP ports
 (allocated deterministically from the project path), data dir, uploads,
@@ -51,7 +52,11 @@ PORT_BASE = 8310
 PORT_SLOTS = 560
 PORT_STRIDE = 10  # server, mcp_http, mcp_sse per slot; room to grow
 
-SERVER_READY_TIMEOUT = 30.0
+# Imports from a virtualenv on a WSL-mounted drive can take close to a minute
+# on a cold filesystem cache (FastAPI/Pydantic are the bulk of it). Give a
+# healthy server enough time while `_server_ready` still exits early if its
+# tmux process dies.
+SERVER_READY_TIMEOUT = 120.0
 
 
 def _python_bin() -> str:
@@ -259,10 +264,45 @@ def parse_agent_spec(spec: str) -> tuple[str, str | None]:
     return base, (mode if sep and mode else None)
 
 
-def _server_ready(port: int, timeout: float) -> bool:
+def select_wrapper_sessions(
+    wrappers: list[tuple[int, str, str]],
+    targets: list[str],
+    aliases: dict[str, str] | None = None,
+) -> tuple[list[tuple[int, str, str]], list[str]]:
+    """Resolve selective-down targets to live wrapper sessions.
+
+    A config agent name (``agy``) selects every running instance of that
+    agent.  A status name (``w2-agy``) selects exactly one instance.
+    """
+    selected: list[tuple[int, str, str]] = []
+    missing: list[str] = []
+    seen_sessions: set[str] = set()
+    aliases = aliases or {}
+
+    for target in targets:
+        resolved_target = aliases.get(target, target)
+        matches = [
+            wrapper for wrapper in wrappers
+            if resolved_target == wrapper[1]
+            or resolved_target == f"w{wrapper[0]}-{wrapper[1]}"
+        ]
+        if not matches:
+            missing.append(target)
+            continue
+        for wrapper in matches:
+            if wrapper[2] not in seen_sessions:
+                selected.append(wrapper)
+                seen_sessions.add(wrapper[2])
+
+    return selected, missing
+
+
+def _server_ready(port: int, timeout: float, alive_checker=None) -> bool:
     deadline = time.monotonic() + timeout
     url = f"http://127.0.0.1:{port}/"
     while time.monotonic() < deadline:
+        if alive_checker is not None and not alive_checker():
+            return False
         try:
             with urllib.request.urlopen(url, timeout=2) as resp:
                 if resp.status == 200:
@@ -354,7 +394,11 @@ def cmd_up(args) -> int:
                            [py, str(ROOT / "run.py"), *iso_flags],
                            logfile=inst.logs_dir / "server.log"):
             return 1
-        if not _server_ready(ports["server"], SERVER_READY_TIMEOUT):
+        if not _server_ready(
+            ports["server"],
+            SERVER_READY_TIMEOUT,
+            alive_checker=lambda: session_exists(inst.server_session()),
+        ):
             print(f"Error: server didn't become ready within {int(SERVER_READY_TIMEOUT)}s.")
             print(f"Last log lines ({inst.logs_dir / 'server.log'}):")
             print(_tail(inst.logs_dir / "server.log"))
@@ -386,6 +430,7 @@ def cmd_up(args) -> int:
             cmd = [
                 py, str(ROOT / "wrapper.py"),
                 "--no-attach",
+                "--replace-reclaimable",
                 *iso_flags,
                 "--session-prefix", inst.prefix,
                 "--mcp-server-name", inst.prefix,
@@ -491,6 +536,45 @@ def cmd_down(args) -> int:
     _check_tmux()
     inst = Instance.here()
     state = inst.state() or {}
+
+    # With positional targets, stop only those wrappers.  The server and MCP
+    # settings stay alive so the remaining swarm is unaffected; `up` can then
+    # recreate the stopped agents from the latest project config.
+    if args.agents:
+        if args.purge:
+            print("Error: --purge cannot be used when stopping selected agents.")
+            return 1
+        wrappers = inst.wrapper_sessions()
+        from registry import normalize_agent_handle
+
+        agents_cfg = _load_agents_config(inst.project_dir)
+        aliases = {
+            normalize_agent_handle(cfg.get("label", "")): base
+            for base, cfg in agents_cfg.items()
+            if normalize_agent_handle(cfg.get("label", ""))
+        }
+        selected, missing = select_wrapper_sessions(wrappers, args.agents, aliases)
+        if missing:
+            running = [f"w{n}-{base}" for n, base, _ in wrappers]
+            print("Error: no running agent matched: " + ", ".join(missing))
+            if running:
+                print("Running agents: " + ", ".join(running))
+            else:
+                print("No agents are running for this project.")
+            return 1
+
+        for _, _, name in selected:
+            kill_session(name)
+
+        stopped = [f"w{n}-{base}" for n, base, _ in selected]
+        print(f"Stopped {len(stopped)} agent(s): " + ", ".join(stopped))
+        print("Server and other agents are still running.")
+        restart_agents = " ".join(base for _, base, _ in selected)
+        print("Start them with the latest config: agentchattr up " + restart_agents)
+        if state:
+            state["last_partial_down"] = datetime.now(timezone.utc).isoformat()
+            save_state(inst.slug, state)
+        return 0
 
     # 1. Controllers first — stops restart loops so agents can't resurrect.
     wrappers = inst.wrapper_sessions()
@@ -627,7 +711,14 @@ def main(argv: list[str] | None = None) -> int:
     p_status.add_argument("--all", action="store_true", help="Show every instance on this machine")
     p_status.set_defaults(func=cmd_status)
 
-    p_down = sub.add_parser("down", help="Stop this project's swarm (agents, then server)")
+    p_down = sub.add_parser(
+        "down",
+        help="Stop selected agents, or the whole swarm when none are listed",
+    )
+    p_down.add_argument(
+        "agents", nargs="*",
+        help="Config/label names (all instances) or exact status names such as w2-agy",
+    )
     p_down.add_argument("--purge", action="store_true", help="Also delete the instance's state/data/logs")
     p_down.set_defaults(func=cmd_down)
 

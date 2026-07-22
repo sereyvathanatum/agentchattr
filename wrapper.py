@@ -414,10 +414,19 @@ def _build_provider_launch(
     return launch_args, launch_env, inject_env, settings_path
 
 
-def _register_instance(server_port: int, base: str, label: str | None = None) -> dict:
+def _register_instance(
+    server_port: int,
+    base: str,
+    label: str | None = None,
+    replace_reclaimable: bool = False,
+) -> dict:
     import urllib.request
 
-    reg_body = json.dumps({"base": base, "label": label}).encode()
+    reg_body = json.dumps({
+        "base": base,
+        "label": label,
+        "replace_reclaimable": replace_reclaimable,
+    }).encode()
     reg_req = urllib.request.Request(
         f"http://127.0.0.1:{server_port}/api/register",
         method="POST",
@@ -683,6 +692,10 @@ def main():
     parser.add_argument("--mcp-server-name", default=None, help="mcpServers key for injected MCP settings (default: agentchattr)")
     parser.add_argument("--no-attach", action="store_true",
                         help="Headless mode: don't attach to the agent's tmux session (for daemonized wrappers)")
+    parser.add_argument(
+        "--replace-reclaimable", action="store_true",
+        help="Replace a recently stopped instance of this configured agent",
+    )
     # Launch shaping: named mode from config.toml plus per-run model/effort.
     parser.add_argument("--mode",   default=None, help="Named mode from [agents.<agent>.modes] in config.toml")
     parser.add_argument("--model",  default=None, help="Model to run the agent with (overrides config)")
@@ -715,8 +728,14 @@ def main():
     server_port = config.get("server", {}).get("port", 8300)
     mcp_cfg = config.get("mcp", {})
 
+    registration_label = args.label or agent_cfg.get("label")
     try:
-        registration = _register_instance(server_port, agent, args.label)
+        registration = _register_instance(
+            server_port,
+            agent,
+            registration_label,
+            replace_reclaimable=args.replace_reclaimable,
+        )
     except Exception as exc:
         print(f"  Registration failed ({exc}).")
         print("  Wrapper cannot continue without a registered identity.")
@@ -896,7 +915,12 @@ def main():
             except urllib.error.HTTPError as exc:
                 if exc.code == 409:
                     try:
-                        replacement = _register_instance(server_port, agent, args.label)
+                        replacement = _register_instance(
+                            server_port,
+                            agent,
+                            registration_label,
+                            replace_reclaimable=args.replace_reclaimable,
+                        )
                         set_runtime_identity(replacement["name"], replacement["token"])
                         _notify_recovery(data_dir, replacement["name"])
                     except Exception:
@@ -1124,6 +1148,18 @@ def main():
     if sys.platform != "win32":
         run_kwargs["terminal"] = _agent_terminal
         run_kwargs["attach"] = not args.no_attach
+
+        # tmux sends SIGHUP when `agentchattr down` kills a worker session.
+        # Turn that into the same controlled unwind as Ctrl+C so run_agent
+        # stops its child and the outer finally block deregisters the identity
+        # before a replacement worker starts.
+        import signal
+
+        def _graceful_session_shutdown(_signum, _frame):
+            raise KeyboardInterrupt
+
+        signal.signal(signal.SIGHUP, _graceful_session_shutdown)
+        signal.signal(signal.SIGTERM, _graceful_session_shutdown)
 
     try:
         run_agent(**run_kwargs)

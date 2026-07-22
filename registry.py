@@ -8,6 +8,7 @@ Thread-safe: a single threading.Lock guards all mutations.
 
 import colorsys
 import json
+import re
 import secrets
 import threading
 import time
@@ -19,7 +20,7 @@ from pathlib import Path
 @dataclass
 class Instance:
     """A live agent instance."""
-    name: str       # canonical ID: "gemini", "gemini-2"
+    name: str       # canonical @handle, derived from the display label
     base: str       # base family: "gemini"
     slot: int       # 1, 2, 3...
     label: str      # "Gemini", "Gemini 2", or human-set custom
@@ -49,10 +50,29 @@ class RuntimeRegistry:
     # --- Setup ---
 
     def seed(self, agents_config: dict):
-        """Load base templates from config.toml [agents.*] section."""
+        """Load base templates and upgrade persisted identities to label handles."""
+        changed = False
         with self._lock:
             for name, cfg in agents_config.items():
                 self._bases[name] = dict(cfg)
+            occupied = set(self._instances) | set(self._reclaimable)
+            for collection in (self._instances, self._reclaimable):
+                for old_name, inst in list(collection.items()):
+                    desired = normalize_agent_handle(inst.label, old_name)
+                    if desired == old_name or desired in occupied:
+                        continue
+                    if self._conflicts_with_other_family(desired, inst.base):
+                        continue
+                    del collection[old_name]
+                    inst.name = desired
+                    collection[desired] = inst
+                    occupied.remove(old_name)
+                    occupied.add(desired)
+                    self._renames[old_name] = desired
+                    changed = True
+        if changed:
+            self._save_renames()
+            self._save_instances()
 
     def on_change(self, cb):
         """Register a callback fired after any registry mutation."""
@@ -180,60 +200,93 @@ class RuntimeRegistry:
         for rn in [rn for rn, ri in self._reclaimable.items()
                    if rn in live_names or (ri.base, ri.slot) in live_coords]:
             del self._reclaimable[rn]
+            # The live identity superseded this stale claimant, so its old
+            # name reservation must not block the live family's next rename.
+            self._reserved.pop(rn, None)
 
     # --- Registration ---
 
-    def register(self, base: str, label: str | None = None) -> dict | None:
-        """Register a new instance of `base`. Returns slot info or None if unknown base.
+    def register(
+        self,
+        base: str,
+        label: str | None = None,
+        replace_reclaimable: bool = False,
+    ) -> dict | str | None:
+        """Register an instance using its display label as its default @handle.
 
-        When a 2nd instance registers, slot 1 is renamed from 'base' to 'base-1'
-        to prevent identity ambiguity. The rename info is returned as '_renamed_slot1'.
+        When a second instance joins a family, both its label and handle receive
+        a slot suffix. Any slot-1 rename is returned as `_renamed_slot1`.
         """
         with self._lock:
             if base not in self._bases:
                 return None
 
             self._expire_reserved()
+            base_cfg = self._bases[base]
+            base_label = (label or base_cfg.get("label") or base.capitalize()).strip()
 
-            # Find next free slot
+            # A detached CLI worker being intentionally restarted has no old
+            # token to present, but it should replace its stopped slot rather
+            # than becoming a temporary second instance during the grace
+            # period. This is opt-in so ordinary registrations retain the
+            # anti-slot-theft reservation behavior.
+            if replace_reclaimable:
+                candidates = sorted(
+                    (
+                        (inst.slot, name)
+                        for name, inst in self._reclaimable.items()
+                        if inst.base == base
+                    ),
+                    key=lambda item: item[0],
+                )
+                if candidates:
+                    _, reclaimable_name = candidates[0]
+                    self._reclaimable.pop(reclaimable_name, None)
+                    self._reserved.pop(reclaimable_name, None)
+
+            # Find the first family slot that is neither live nor reserved by a
+            # recently disconnected, recoverable identity.
             taken = {i.slot for i in self._instances.values() if i.base == base}
-            reserved = set()
-            for rn in self._reserved:
-                rb, rs = self._parse_name(rn)
-                if rb == base:
-                    reserved.add(rs)
-
+            reserved = {
+                inst.slot
+                for name, inst in self._reclaimable.items()
+                if name in self._reserved and inst.base == base
+            }
             slot = 1
             while slot in taken or slot in reserved:
                 slot += 1
 
-            # When a 2nd instance registers, rename slot-1 from "base" to "base-1"
-            # so that no instance shares a name with the base family.  This prevents
-            # a second instance from sending messages as "base" (identity theft).
+            lbl = base_label if slot == 1 else f"{base_label} {slot}"
+            fallback_name = base if slot == 1 else f"{base}-{slot}"
+            name = normalize_agent_handle(lbl, fallback_name)
+            if name in self._instances or name in self._reserved:
+                return f"Display label handle already taken: {name}"
+            if family_err := self._conflicts_with_other_family(name, base):
+                return family_err
+
+            # Once a family has multiple instances, make slot 1 explicit too:
+            # "Claude" -> @claude-1, or "Research Agent" -> @research-agent-1.
             renamed_slot1 = None
-            if slot >= 2 and base in self._instances:
-                slot1 = self._instances[base]
-                if slot1.base == base and slot1.slot == 1:
-                    new_s1_name = f"{base}-1"
-                    del self._instances[base]
+            slot1 = next(
+                (inst for inst in self._instances.values()
+                 if inst.base == base and inst.slot == 1),
+                None,
+            )
+            if slot >= 2 and slot1 and len(taken) == 1:
+                old_s1_name = slot1.name
+                new_s1_label = f"{slot1.label} 1"
+                new_s1_name = normalize_agent_handle(new_s1_label, f"{base}-1")
+                if new_s1_name != old_s1_name:
+                    if new_s1_name in self._instances or new_s1_name in self._reserved:
+                        return f"Display label handle already taken: {new_s1_name}"
+                    del self._instances[old_s1_name]
                     slot1.name = new_s1_name
-                    base_cfg = self._bases[base]
-                    slot1.label = f"{base_cfg.get('label', base.capitalize())} 1"
-                    # Color stays the same (slot 1 = base color)
+                    slot1.label = new_s1_label
                     self._instances[new_s1_name] = slot1
-                    self._renames[base] = new_s1_name
-                    renamed_slot1 = {"old": base, "new": new_s1_name}
+                    self._renames[old_s1_name] = new_s1_name
+                    renamed_slot1 = {"old": old_s1_name, "new": new_s1_name}
 
-            name = base if slot == 1 else f"{base}-{slot}"
-            base_cfg = self._bases[base]
             color = _derive_color(base_cfg.get("color", "#888"), slot)
-
-            if label:
-                lbl = label
-            elif slot == 1:
-                lbl = base_cfg.get("label", base.capitalize())
-            else:
-                lbl = f"{base_cfg.get('label', base.capitalize())} {slot}"
 
             # Fresh registrations are immediately authoritative. Identity
             # recovery/reclaim still uses chat_claim, but normal startup should
@@ -241,9 +294,8 @@ class RuntimeRegistry:
             state = "active"
             inst = Instance(name=name, base=base, slot=slot, label=lbl, color=color, state=state)
             self._instances[name] = inst
-            # Fresh registration (plus any slot-1 rename above) supersedes reclaimable
-            # identities sharing those names/(base, slot) coordinates — including custom
-            # aliases that don't match `name`. Enforces fresh-wins by coordinate, not name.
+            # Fresh registrations supersede reclaimable identities sharing their
+            # (base, slot), even if the old identity used a different handle.
             self._evict_reclaimable_collisions_locked()
             result = _inst_dict(inst, include_token=True)
             if renamed_slot1:
@@ -274,18 +326,19 @@ class RuntimeRegistry:
             family = [i for i in self._instances.values() if i.base == base]
             if len(family) == 1:
                 remaining = family[0]
-                r_base, r_slot = self._parse_name(remaining.name)
-                if r_base == base and remaining.name != base:
+                base_cfg = self._bases.get(base, {})
+                default_label = base_cfg.get("label", base.capitalize())
+                default_name = normalize_agent_handle(default_label, base)
+                if remaining.name != default_name and default_name not in self._instances:
                     old_name = remaining.name
                     del self._instances[old_name]
-                    remaining.name = base
+                    remaining.name = default_name
                     remaining.slot = 1
-                    base_cfg = self._bases.get(base, {})
-                    remaining.label = base_cfg.get("label", base.capitalize())
+                    remaining.label = default_label
                     remaining.color = _derive_color(base_cfg.get("color", "#888"), 1)
-                    self._instances[base] = remaining
-                    self._renames[old_name] = base
-                    renamed_back = {"old": old_name, "new": base}
+                    self._instances[default_name] = remaining
+                    self._renames[old_name] = default_name
+                    renamed_back = {"old": old_name, "new": default_name}
 
             # A rename-back may have moved a live instance onto a (base, slot) that the
             # just-deregistered identity still occupies in _reclaimable — drop such stale
@@ -715,6 +768,14 @@ class RuntimeRegistry:
 
 
 # --- Module-level helpers ---
+
+def normalize_agent_handle(label: str, fallback: str = "") -> str:
+    """Convert a display label to a safe, single-token registry/@mention name."""
+    if not isinstance(label, str):
+        return fallback
+    handle = re.sub(r"[^a-z0-9-]", "", label.lower().replace(" ", "-")).strip("-")
+    return handle or fallback
+
 
 def _inst_dict(inst: Instance, include_token: bool = False) -> dict:
     d = {

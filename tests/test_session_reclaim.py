@@ -9,6 +9,7 @@ still supersede the old token.
 """
 
 import sys
+import json
 import unittest
 import tempfile
 import shutil
@@ -75,6 +76,32 @@ class SessionReclaimTests(unittest.TestCase):
         reg2.seed({"claude": {"label": "Claude", "color": "#ff6a00"}})
         self.assertIsNotNone(reg2.resolve_token(token),
                              "token should survive a server restart via persistence")
+
+    def test_restart_migrates_legacy_registry_name_to_label_handle(self):
+        """Old `agy2` identities become `antigravity-2` without losing the token."""
+        legacy = {
+            "name": "agy2",
+            "base": "agy2",
+            "slot": 1,
+            "label": "Antigravity 2",
+            "color": "#060276",
+            "identity_id": "legacy-id",
+            "token": "legacy-token",
+            "epoch": 1,
+            "state": "active",
+            "registered_at": 1.0,
+        }
+        Path(self.tmp, "registry.json").write_text(
+            json.dumps({"instances": {"agy2": legacy}, "reclaimable": {}}),
+            "utf-8",
+        )
+
+        reg2 = RuntimeRegistry(data_dir=self.tmp)
+        reg2.seed({"agy2": {"label": "Antigravity 2", "color": "#060276"}})
+        resolved = reg2.resolve_token("legacy-token")
+
+        self.assertEqual(resolved["name"], "antigravity-2")
+        self.assertEqual(reg2.resolve_name("agy2"), "antigravity-2")
 
     def test_fresh_register_after_restart_takes_slot1_not_ghost(self):
         """After a server restart, a fresh wrapper must reclaim slot-1 'claude'.
