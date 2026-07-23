@@ -1762,6 +1762,11 @@ function applySettings(data) {
     if (data.max_agent_hops !== undefined) {
         document.getElementById('setting-hops').value = data.max_agent_hops;
     }
+    if (data.loop_guard_enabled !== undefined) {
+        const enabled = data.loop_guard_enabled !== false;
+        document.getElementById('setting-loop-guard').checked = enabled;
+        applyLoopGuardUI(enabled);
+    }
     if (data.history_limit !== undefined) {
         document.getElementById('setting-history').value = String(data.history_limit);
     }
@@ -1792,6 +1797,15 @@ function applySettings(data) {
             switchChannel(name);
         }
     }
+}
+
+// Dim the max-hops stepper when the loop guard is switched off — the
+// number has no effect while the guard is disabled.
+function applyLoopGuardUI(enabled) {
+    const wrap = document.getElementById('setting-hops-wrap');
+    const input = document.getElementById('setting-hops');
+    if (wrap) wrap.classList.toggle('sched-dimmed', !enabled);
+    if (input) input.disabled = !enabled;
 }
 
 function toggleSettings() {
@@ -1874,6 +1888,7 @@ function saveSettings() {
     const newUsername = document.getElementById('setting-username').value.trim();
     const newFont = document.getElementById('setting-font').value;
     const newHops = document.getElementById('setting-hops').value;
+    const newLoopGuard = document.getElementById('setting-loop-guard').checked;
     const histVal = document.getElementById('setting-history').value;
     const newHistory = histVal === 'all' ? 'all' : (parseInt(histVal) || 50);
     const newContrast = document.getElementById('setting-contrast').value;
@@ -1886,6 +1901,7 @@ function saveSettings() {
                 username: newUsername || 'user',
                 font: newFont,
                 max_agent_hops: parseInt(newHops) || 4,
+                loop_guard_enabled: newLoopGuard,
                 history_limit: newHistory,
                 contrast: newContrast,
                 rules_refresh_interval: parseInt(newRulesRefresh) || 0,
@@ -1907,6 +1923,15 @@ function setupSettingsKeys() {
             if (e.key === 'Escape') {
                 toggleSettings();
             }
+        });
+    }
+
+    // Loop guard on/off switch: apply immediately, then persist.
+    const loopGuardEl = document.getElementById('setting-loop-guard');
+    if (loopGuardEl) {
+        loopGuardEl.addEventListener('change', () => {
+            applyLoopGuardUI(loopGuardEl.checked);
+            saveSettings();
         });
     }
 

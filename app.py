@@ -55,6 +55,7 @@ room_settings: dict = {
     "history_limit": "all",
     "contrast": "normal",
     "custom_roles": [],
+    "loop_guard_enabled": True,
 }
 
 # Channel validation
@@ -314,6 +315,7 @@ def configure(cfg: dict, session_token: str = ""):
     # Apply saved loop guard setting
     if "max_agent_hops" in room_settings:
         router.max_hops = room_settings["max_agent_hops"]
+    router.guard_enabled = bool(room_settings.get("loop_guard_enabled", True))
 
     # Background thread: check for wrapper recovery flag files
     _data_dir = Path(data_dir)
@@ -1423,6 +1425,15 @@ async def websocket_endpoint(websocket: WebSocket):
                         router.max_hops = hops
                     except (ValueError, TypeError):
                         pass
+                if "loop_guard_enabled" in new:
+                    enabled = bool(new["loop_guard_enabled"])
+                    room_settings["loop_guard_enabled"] = enabled
+                    router.guard_enabled = enabled
+                    if not enabled:
+                        # Clear any active pauses so agents resume immediately.
+                        for ch in room_settings.get("channels", ["general"]):
+                            router.continue_routing(ch)
+                        await broadcast_status()
                 if "contrast" in new and new["contrast"] in ("normal", "high"):
                     room_settings["contrast"] = new["contrast"]
                 if "rules_refresh_interval" in new:

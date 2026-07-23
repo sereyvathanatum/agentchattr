@@ -63,5 +63,34 @@ class RouterMentionTests(unittest.TestCase):
         self.assertEqual(router.get_targets("ben", "@telegram-bot check"), [])
 
 
+class RouterLoopGuardTests(unittest.TestCase):
+    def test_guard_pauses_after_max_hops(self):
+        router = Router(["a", "b"], default_mention="none", max_hops=2)
+
+        # Each agent-to-agent hop counts; the hop past max_hops pauses.
+        self.assertEqual(router.get_targets("a", "@b hi"), ["b"])
+        self.assertEqual(router.get_targets("b", "@a hi"), ["a"])
+        self.assertEqual(router.get_targets("a", "@b hi"), [])
+        self.assertTrue(router.is_paused())
+
+    def test_disabled_guard_never_pauses(self):
+        router = Router(["a", "b"], default_mention="none", max_hops=2,
+                        guard_enabled=False)
+
+        for _ in range(10):
+            self.assertEqual(router.get_targets("a", "@b hi"), ["b"])
+            self.assertEqual(router.get_targets("b", "@a hi"), ["a"])
+        self.assertFalse(router.is_paused())
+
+    def test_guard_can_be_toggled_off_at_runtime(self):
+        router = Router(["a", "b"], default_mention="none", max_hops=2)
+
+        router.guard_enabled = False
+        for _ in range(10):
+            router.get_targets("a", "@b hi")
+            router.get_targets("b", "@a hi")
+        self.assertFalse(router.is_paused())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -6,10 +6,12 @@ import re
 class Router:
     def __init__(self, agent_names: list[str], default_mention: str = "both",
                  max_hops: int = 4, online_checker=None,
-                 mention_aliases: dict[str, str | list[str]] | None = None):
+                 mention_aliases: dict[str, str | list[str]] | None = None,
+                 guard_enabled: bool = True):
         self.agent_names = set(n.lower() for n in agent_names)
         self.default_mention = default_mention
         self.max_hops = max_hops
+        self.guard_enabled = guard_enabled
         self._online_checker = online_checker  # callable() -> set of online agent names
         self._mention_aliases: dict[str, set[str]] = {}
         self._set_mention_aliases(mention_aliases or {})
@@ -97,12 +99,23 @@ class Router:
             # Only route if explicit @mention
             if not mentions:
                 return []
-            ch["hop_count"] += 1
-            if ch["hop_count"] > self.max_hops:
-                ch["paused"] = True
+            if self._register_hop(ch):
                 return []
             # Don't route back to self
             return [m for m in mentions if m != sender]
+
+    def _register_hop(self, ch: dict) -> bool:
+        """Count an agent-to-agent hop and pause the channel if the loop
+        guard trips. Returns True when routing should be blocked. When the
+        guard is disabled, hops are never counted so chatter can't auto-pause.
+        """
+        if not self.guard_enabled:
+            return False
+        ch["hop_count"] += 1
+        if ch["hop_count"] > self.max_hops:
+            ch["paused"] = True
+            return True
+        return False
 
     def continue_routing(self, channel: str = "general"):
         """Resume after loop guard pause."""

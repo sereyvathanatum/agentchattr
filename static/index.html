@@ -71,8 +71,12 @@
                 </select>
             </div>
             <div class="settings-field">
-                <label for="setting-hops">Loop guard</label>
-                <div class="sched-num-wrap">
+                <label for="setting-loop-guard">Loop guard</label>
+                <label class="toggle-switch" title="Enable or disable the agent-to-agent loop guard">
+                    <input type="checkbox" id="setting-loop-guard" checked>
+                    <span class="toggle-slider"></span>
+                </label>
+                <div class="sched-num-wrap" id="setting-hops-wrap" title="Max agent-to-agent hops before pausing">
                     <input type="number" id="setting-hops" class="sched-pop-num" min="1" max="50" value="4" title="Max agent-to-agent hops before pausing">
                     <div class="sched-num-btns">
                         <button type="button" onclick="stepNumInput('setting-hops',1)" tabindex="-1">&#9650;</button>
